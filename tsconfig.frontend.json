@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "files": ["src/vite-env.d.ts", "src/App.tsx"],
+  "include": [],
+  "exclude": ["node_modules", "dist", "project_archive"]
+}
