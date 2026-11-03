@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>UniInfo — Private university intelligence</title>
+    <meta name="description" content="A private intelligence layer for choosing where your future begins. Verified Indian universities, appraised on academics, outcomes, and return on investment." />
+    <meta property="og:title" content="UniInfo — Private university intelligence" />
+    <meta property="og:description" content="Verified Indian universities, appraised on academics, outcomes, and return on investment." />
+    <meta name="theme-color" content="#f1ecdf" />
+    <script>
+      // Prevent benign development websocket closing errors from tripping the unhandled rejection modal
+      window.addEventListener('unhandledrejection', function(event) {
+        var reason = event && event.reason;
+        var msg = (reason && (reason.message || reason.toString())) || '';
+        if (msg.indexOf('WebSocket') !== -1 || msg.indexOf('websocket') !== -1) {
+          event.preventDefault();
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
