@@ -9,6 +9,7 @@ const role = v.union(
   v.literal("Admin"),
 );
 const counterTableName = v.union(
+  v.literal("universities"),
   v.literal("users"),
   v.literal("reviews"),
   v.literal("bookmarks"),
@@ -18,6 +19,7 @@ const counterTableName = v.union(
   v.literal("studentProfiles"),
   v.literal("parentProfiles"),
   v.literal("notifications"),
+  v.literal("analyticsEvents"),
 );
 const migrationTableName = v.union(
   v.literal("universities"),

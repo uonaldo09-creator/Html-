@@ -13,7 +13,12 @@ import {
 import type { MigrationDestination } from "./convexMigrationDestination";
 import { transformPostgresMigrationRecord } from "./convexMigrationTransform";
 
-export type MigrationMode = "validate-only" | "dry-run" | "synthetic" | "verify";
+export type MigrationMode =
+  | "validate-only"
+  | "dry-run"
+  | "synthetic"
+  | "postgres-import"
+  | "verify";
 
 export interface MigrationSource {
   readonly kind: "postgres" | "synthetic";
@@ -31,7 +36,31 @@ export interface MigrationExecutionOptions {
   approvedWarningCodes?: readonly string[];
   isolatedSyntheticDeployment?: string;
   confirmSyntheticImport?: boolean;
+  /** Positively identified isolated staging deployment receiving real data. */
+  isolatedStagingDeployment?: string;
+  /** Explicit acknowledgement that this run writes real source records. */
+  confirmPostgresImport?: boolean;
 }
+
+/**
+ * Tables whose legacy IDs must be reserved in the durable Convex ID counter so
+ * future allocations can never collide with imported rows. `sessions` is keyed
+ * by a token hash and `universityReviewsAgg` by a foreign university id, so
+ * neither owns an independent ID sequence.
+ */
+const counterBackedTables = new Set<SourceTable>([
+  "universities",
+  "users",
+  "reviews",
+  "bookmarks",
+  "chatHistory",
+  "auditLogs",
+  "loginAttempts",
+  "studentProfiles",
+  "parentProfiles",
+  "notifications",
+  "analyticsEvents",
+]);
 
 export interface MigrationExecutionResult {
   mode: MigrationMode;
@@ -120,8 +149,23 @@ export async function runConvexMigration(
   ) {
     throw new Error("Synthetic writes require a confirmed isolated synthetic source and destination.");
   }
-  if (options.mode === "verify" && (!destination || source.kind !== "synthetic")) {
-    throw new Error("Verification mode requires an isolated synthetic destination and source.");
+  if (
+    options.mode === "postgres-import" &&
+    (source.kind !== "postgres" ||
+      !destination ||
+      !options.confirmPostgresImport ||
+      !options.isolatedStagingDeployment ||
+      options.isolatedStagingDeployment === CURRENT_DEVELOPMENT_DEPLOYMENT ||
+      options.isolatedStagingDeployment === "clear-gopher-925" ||
+      options.isolatedStagingDeployment === "prod")
+  ) {
+    throw new Error("Real-data imports require a confirmed read-only PostgreSQL source and isolated staging destination.");
+  }
+  if (
+    options.mode === "verify" &&
+    (!destination || (source.kind !== "synthetic" && source.kind !== "postgres"))
+  ) {
+    throw new Error("Verification mode requires an isolated destination and a synthetic or PostgreSQL source.");
   }
 
   await source.beginReadOnlySnapshot();
@@ -147,6 +191,29 @@ export async function runConvexMigration(
       throw new Error("Migration source changed during preflight.");
     }
 
+    // Raise each counter-backed table's floor before any write, so an ID handed
+    // out while the import is running can never collide with a legacy ID that is
+    // still being streamed in.
+    if (options.mode === "postgres-import") {
+      if (!destination.reserveIdCounterFloor) {
+        throw new Error("Real-data destination cannot reserve ID counters.");
+      }
+      for (const { source: table } of migrationTables) {
+        if (!counterBackedTables.has(table)) continue;
+        let maxLegacyId = 0;
+        for (const value of snapshot[table]) {
+          const transformed = transformPostgresMigrationRecord(table, value).value as
+            | Record<string, unknown>
+            | undefined;
+          const id = transformed?.legacyId;
+          if (typeof id === "number" && Number.isSafeInteger(id) && id > maxLegacyId) {
+            maxLegacyId = id;
+          }
+        }
+        await destination.reserveIdCounterFloor(table, maxLegacyId + 1);
+      }
+    }
+
     const tables = await runBatchedMigration(composeAdapter(source, destination), {
       batchSize: options.batchSize,
       maxRetries: options.maxRetries,
@@ -157,6 +224,30 @@ export async function runConvexMigration(
       migrationTables.some(({ source: table }) => tables[table].plannedInsert > 0)
     ) {
       throw new Error("Destination verification found source records missing from Convex.");
+    }
+    if (options.mode === "postgres-import") {
+      if (!destination.listMissingKeys) {
+        throw new Error("Real-data destination cannot verify destination keys.");
+      }
+      for (const { source: table } of migrationTables) {
+        const expected = snapshot[table]
+          .map((value) => transformPostgresMigrationRecord(table, value).key)
+          .sort();
+        const actual = (await destination.listKeys(table)).sort();
+        if (
+          expected.length !== actual.length ||
+          expected.some((key, index) => key !== actual[index])
+        ) {
+          throw new Error(`Destination key verification failed for table ${table}.`);
+        }
+        const missing = await destination.listMissingKeys(table, expected);
+        if (missing.length > 0) {
+          throw new Error(`Destination is missing ${missing.length} expected key(s) for table ${table}.`);
+        }
+      }
+      if (await source.sourceFingerprint() !== fingerprint) {
+        throw new Error("Migration source changed during reconciliation.");
+      }
     }
     if (options.mode === "verify" || options.mode === "synthetic") {
       const expectedKeys = Object.fromEntries(

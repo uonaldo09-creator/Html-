@@ -145,7 +145,7 @@ export function assertUniqueMigrationKeys<T>(
   }
 }
 
-async function byLegacyId(ctx: MutationCtx, table: MigrationTable, legacyId: number) {
+async function byLegacyId(ctx: QueryCtx | MutationCtx, table: MigrationTable, legacyId: number) {
   if (!Number.isSafeInteger(legacyId)) fail("INVALID_RECORD");
   switch (table) {
     case "universities": return ctx.db.query("universities").withIndex("by_legacy_id", (query) => query.eq("legacyId", legacyId)).collect();
@@ -603,6 +603,97 @@ export const migrateUniversityReviewsAgg = batchMutation(
   (ctx, doc) => ctx.db.insert("universityReviewsAgg", doc),
   (doc) => String(doc.universityId),
 );
+
+const counterTable = v.union(
+  v.literal("universities"),
+  v.literal("users"),
+  v.literal("reviews"),
+  v.literal("bookmarks"),
+  v.literal("chatHistory"),
+  v.literal("auditLogs"),
+  v.literal("loginAttempts"),
+  v.literal("studentProfiles"),
+  v.literal("parentProfiles"),
+  v.literal("notifications"),
+  v.literal("analyticsEvents"),
+);
+
+/**
+ * Raises the durable ID counter for a table so it can never hand out a value at
+ * or below an imported legacy ID. The counter only ever moves forward, so a
+ * repeated import is a no-op. `nextId` is the value to be returned by the next
+ * allocation, so a table whose maximum legacy ID is N is reserved as N + 1.
+ */
+export const reserveIdCounterFloor = internalMutation({
+  args: { tableName: counterTable, nextId: v.number() },
+  handler: async (ctx, { tableName, nextId }) => {
+    if (!Number.isSafeInteger(nextId) || nextId < 1) fail("INVALID_COUNTER");
+    const existing = await ctx.db.query("idCounters").withIndex("by_table_name", (query) =>
+      query.eq("tableName", tableName)).unique();
+    if (!existing) {
+      await ctx.db.insert("idCounters", { tableName, nextId });
+      return { nextId, advanced: true };
+    }
+    if (nextId > existing.nextId) {
+      await ctx.db.patch(existing._id, { nextId });
+      return { nextId, advanced: true };
+    }
+    return { nextId: existing.nextId, advanced: false };
+  },
+});
+
+/**
+ * Allocates the next legacy-style integer ID for a table. It only ever returns
+ * values strictly above the reserved floor, so a freshly imported row can never
+ * be handed out twice. Internal-only; ordinary clients cannot reach it.
+ */
+export const allocateNextLegacyId = internalMutation({
+  args: { tableName: counterTable },
+  handler: async (ctx, { tableName }) => {
+    const existing = await ctx.db.query("idCounters").withIndex("by_table_name", (query) =>
+      query.eq("tableName", tableName)).unique();
+    if (!existing) {
+      await ctx.db.insert("idCounters", { tableName, nextId: 2 });
+      return { id: 1 };
+    }
+    const id = existing.nextId;
+    if (!Number.isSafeInteger(id) || id < 1) fail("INVALID_COUNTER");
+    await ctx.db.patch(existing._id, { nextId: id + 1 });
+    return { id };
+  },
+});
+
+/**
+ * Reports which of the supplied legacy keys are absent from a table. Used only
+ * for bounded read-only key verification; it never writes.
+ */
+export const listMissingKeys = internalQuery({
+  args: {
+    tableName: v.union(...migrationTables.map((table) => v.literal(table))),
+    keys: v.array(v.string()),
+  },
+  handler: async (ctx, { tableName, keys }) => {
+    if (keys.length > 100) fail("BATCH_TOO_LARGE");
+    const missing: string[] = [];
+    for (const key of keys) {
+      const exists = await (async () => {
+        if (tableName === "sessions") {
+          return !!await ctx.db.query("sessions").withIndex("by_token_hash", (query) =>
+            query.eq("sessionTokenHash", key)).unique();
+        }
+        const legacyId = Number(key);
+        if (!Number.isSafeInteger(legacyId)) fail("INVALID_RECORD");
+        if (tableName === "universityReviewsAgg") {
+          return !!await ctx.db.query("universityReviewsAgg").withIndex("by_legacy_university", (query) =>
+            query.eq("legacyUniversityId", legacyId)).unique();
+        }
+        return (await byLegacyId(ctx, tableName, legacyId)).length > 0;
+      })();
+      if (!exists) missing.push(key);
+    }
+    return { missing };
+  },
+});
 
 export const getCheckpoint = internalQuery({
   args: { tableName: v.union(...migrationTables.map((table) => v.literal(table))) },

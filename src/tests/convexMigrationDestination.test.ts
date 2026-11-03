@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { ConvexMigrationDestination } from "../server/convexMigrationDestination";
+import {
+  ConvexInternalHttpTransport,
+  ConvexMigrationDestination,
+} from "../server/convexMigrationDestination";
 
 function makeDestination(response: unknown) {
   const calls: { functionName: string; args: Record<string, unknown> }[] = [];
@@ -92,5 +95,68 @@ describe("ConvexMigrationDestination analytics events", () => {
       key: "101",
       value: { legacyId: 101 },
     }])).rejects.toThrow(/keys do not match the source batch/);
+  });
+});
+
+describe("Convex destination identity guards", () => {
+  const stagingOptions = {
+    url: "https://isolated-staging-123.us-east-1.convex.cloud",
+    deploymentName: "isolated-staging-123",
+    adminKey: "admin-key",
+    isolatedStagingConfirmed: true,
+  };
+
+  it("accepts a positively identified isolated staging deployment", () => {
+    expect(() => ConvexInternalHttpTransport.create(stagingOptions)).not.toThrow();
+  });
+
+  it("refuses protected deployments even when a role is confirmed", () => {
+    for (const deploymentName of ["prod", "graceful-kangaroo-272"]) {
+      expect(() => ConvexInternalHttpTransport.create({
+        ...stagingOptions,
+        deploymentName,
+        url: `https://${deploymentName}.us-east-1.convex.cloud`,
+      })).toThrow(/isolated target/);
+    }
+  });
+
+  it("never routes a real staging import to the synthetic rehearsal deployment", () => {
+    expect(() => ConvexInternalHttpTransport.create({
+      ...stagingOptions,
+      deploymentName: "clear-gopher-925",
+      url: "https://clear-gopher-925.us-east-1.convex.cloud",
+    })).toThrow(/isolated target/);
+    // The synthetic role may still use it for rehearsals.
+    expect(() => ConvexInternalHttpTransport.create({
+      url: "https://clear-gopher-925.us-east-1.convex.cloud",
+      deploymentName: "clear-gopher-925",
+      adminKey: "admin-key",
+      isolatedSyntheticConfirmed: true,
+    })).not.toThrow();
+  });
+
+  it("refuses a staging role without explicit confirmation", () => {
+    expect(() => ConvexInternalHttpTransport.create({
+      ...stagingOptions,
+      isolatedStagingConfirmed: false,
+    })).toThrow(/isolated target/);
+  });
+
+  it("refuses a deployment-name and host mismatch", () => {
+    expect(() => ConvexInternalHttpTransport.create({
+      ...stagingOptions,
+      deploymentName: "other-deployment-999",
+    })).toThrow(/isolated target/);
+  });
+
+  it("refuses a destination whose identity is protected or mismatched", () => {
+    const transport = {
+      deploymentName: "isolated-staging-123",
+      async invoke<T>() { return undefined as T; },
+    };
+    expect(() => new ConvexMigrationDestination(transport, "isolated-staging-123")).not.toThrow();
+    expect(() => new ConvexMigrationDestination(transport, "prod")).toThrow();
+    expect(() => new ConvexMigrationDestination(transport, "graceful-kangaroo-272")).toThrow();
+    expect(() => new ConvexMigrationDestination(transport, "different")).toThrow();
   });
 });

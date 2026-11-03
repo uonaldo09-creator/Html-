@@ -16,6 +16,19 @@ declare module "convex/browser" {
 }
 
 const CURRENT_DEVELOPMENT_DEPLOYMENT = "graceful-kangaroo-272";
+/**
+ * Deployments that must never receive any migration writes: the existing
+ * development deployment and production.
+ */
+const PROTECTED_DESTINATIONS = new Set([
+  "prod",
+  "graceful-kangaroo-272",
+]);
+/**
+ * The synthetic rehearsal deployment. It is allowed only for synthetic
+ * rehearsals and must never receive migrated real data.
+ */
+const SYNTHETIC_ONLY_DESTINATION = "clear-gopher-925";
 const TABLE_MUTATIONS: Record<SourceTable, string> = {
   universities: "migration:migrateUniversities",
   users: "migration:migrateUsers",
@@ -57,6 +70,14 @@ export interface MigrationDestination {
   loadCheckpoint(table: SourceTable): Promise<MigrationCheckpoint | null>;
   saveCheckpoint(table: SourceTable, checkpoint: MigrationCheckpoint): Promise<void>;
   listKeys(table: SourceTable): Promise<string[]>;
+  /**
+   * Raises the durable ID counter so future allocations cannot collide with
+   * imported legacy IDs. Present only on real-data destinations; the synthetic
+   * and dry-run planners omit it.
+   */
+  reserveIdCounterFloor?(table: SourceTable, nextId: number): Promise<void>;
+  /** Read-only membership check used for bounded final key reconciliation. */
+  listMissingKeys?(table: SourceTable, keys: readonly string[]): Promise<string[]>;
 }
 
 export class ConvexInternalHttpTransport implements InternalMigrationTransport {
@@ -69,7 +90,8 @@ export class ConvexInternalHttpTransport implements InternalMigrationTransport {
     url: string;
     deploymentName: string;
     adminKey: string;
-    isolatedSyntheticConfirmed: boolean;
+    isolatedSyntheticConfirmed?: boolean;
+    isolatedStagingConfirmed?: boolean;
   }): ConvexInternalHttpTransport {
     const parsed = new URL(options.url);
     const hostname = parsed.hostname.split(".");
@@ -83,17 +105,26 @@ export class ConvexInternalHttpTransport implements InternalMigrationTransport {
         /^[a-z]{2,}(?:-[a-z0-9]+)+$/.test(hostname[1]) &&
         hostname[2] === "convex" &&
         hostname[3] === "cloud");
+    // A synthetic rehearsal and a real staging import are distinct roles. Each
+    // must be positively confirmed. Neither may name the existing dev target or
+    // prod; a staging (real-data) target may additionally never be the synthetic
+    // rehearsal deployment.
+    const confirmedRole = options.isolatedSyntheticConfirmed
+      ? "synthetic"
+      : options.isolatedStagingConfirmed
+        ? "staging"
+        : null;
     if (
       parsed.protocol !== "https:" ||
       parsed.port !== "" ||
       !matchesDeployment ||
       !options.deploymentName ||
-      options.deploymentName === "prod" ||
-      options.deploymentName === CURRENT_DEVELOPMENT_DEPLOYMENT ||
-      !options.isolatedSyntheticConfirmed ||
+      PROTECTED_DESTINATIONS.has(options.deploymentName) ||
+      (confirmedRole === "staging" && options.deploymentName === SYNTHETIC_ONLY_DESTINATION) ||
+      confirmedRole === null ||
       !options.adminKey
     ) {
-      throw new Error("Convex migration destination is not positively identified as isolated synthetic.");
+      throw new Error("Convex migration destination is not positively identified as an isolated target.");
     }
     const client = new ConvexHttpClient(parsed.origin, { logger: false });
     client.setAdminAuth(options.adminKey);
@@ -113,8 +144,7 @@ export class ConvexMigrationDestination implements MigrationDestination {
     if (
       !expectedIsolatedDeployment ||
       expectedIsolatedDeployment !== transport.deploymentName ||
-      expectedIsolatedDeployment === CURRENT_DEVELOPMENT_DEPLOYMENT ||
-      expectedIsolatedDeployment === "prod"
+      PROTECTED_DESTINATIONS.has(expectedIsolatedDeployment)
     ) {
       throw new Error("Convex migration destination does not match the isolated deployment identity.");
     }
@@ -246,6 +276,40 @@ export class ConvexMigrationDestination implements MigrationDestination {
       tableName: table,
       ...checkpoint,
     });
+  }
+
+  async reserveIdCounterFloor(table: SourceTable, nextId: number): Promise<void> {
+    if (!Number.isSafeInteger(nextId) || nextId < 1) {
+      throw new RangeError("Reserved ID counter floor must be a positive safe integer.");
+    }
+    const result = await this.transport.invoke<{ nextId: number; advanced: boolean }>(
+      "migration:reserveIdCounterFloor",
+      { tableName: table, nextId },
+    );
+    if (
+      typeof result?.nextId !== "number" ||
+      !Number.isSafeInteger(result.nextId) ||
+      typeof result.advanced !== "boolean" ||
+      result.nextId < nextId
+    ) {
+      throw new Error("Convex ID counter reservation response is invalid.");
+    }
+  }
+
+  async listMissingKeys(table: SourceTable, keys: readonly string[]): Promise<string[]> {
+    const missing: string[] = [];
+    for (let offset = 0; offset < keys.length; offset += 100) {
+      const page = keys.slice(offset, offset + 100);
+      const result = await this.transport.invoke<{ missing: string[] }>(
+        "migration:listMissingKeys",
+        { tableName: table, keys: page },
+      );
+      if (!Array.isArray(result?.missing) || result.missing.some((key) => typeof key !== "string")) {
+        throw new Error("Convex missing-key response is invalid.");
+      }
+      missing.push(...result.missing);
+    }
+    return missing;
   }
 
   async verifyKeySets(expected: Readonly<Record<SourceTable, readonly string[]>>): Promise<void> {
