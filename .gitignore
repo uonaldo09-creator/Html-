@@ -1,0 +1,101 @@
+# Dependency lockfile
+pnpm-lock.yaml
+yarn.lock
+bun.lockb
+
+# Build outputs
+dist/
+server.js
+
+# Environment variables (firebase / database / api secrets)
+
+# Environment files and secrets
+.env*
+!.env.example
+
+# Legacy Firebase config dump (never commit credentials).
+firebase-applet-config.json
+
+# Logs and debug output
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+
+# Coverage
+coverage/
+*.lcov
+
+# OS / editor / runtime junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Project-specific
+node_modules/
+public/build/
+server-build/
+project_archive/
+freebuff/
+.chromium/
+.devcontainer/
+
+# Database / migration artifacts
+
+# Backups may contain sensitive data
+backups/
+
+# Binary / archive artifacts
+*.zip
+*.tar.gz
+*.tgz
+*.db
+*.sqlite
+# Private credentials and exported database artifacts
+.pgpass
+*.pem
+*.key
+*.dump
+*.pgdump
+*.backup
+*.enc
+*.partial
+*manifest.json
+secrets/
+private/
+.env
+.env.*
+FreshExports/
+*.pgdump.enc
+*.json.enc
+
+# Local TLS certificates and generated migration reports
+certs/
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# Generated local report, not application source
+migration-rehearsal-final-report.txt
+
+# Keep the safe environment template available for deployment documentation
+!.env.example
+
+# Local backup and one-off rehearsal files
+*.bak
+
+# Local backup and one-off rehearsal files
+/src/restoreFreshExportRehearsal.mjs
+
+# Local-only restore rehearsal helper
+/scripts/restoreFreshExportRehearsal.mjs

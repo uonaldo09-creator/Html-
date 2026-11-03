@@ -1,0 +1,47 @@
+# Environment files and credentials
+.env*
+**/.env*
+**/.local-keys/
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/*.jks
+**/*credentials*
+!.env.example
+
+# Dependencies and version control
+**/node_modules/
+.git/
+**/.git/
+
+# Local output and data
+dist/
+**/dist/
+coverage/
+build/
+server-build/
+backups/
+**/backups/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# Local projects and development artifacts
+uniinfo-auth-poc/
+.freebuff/
+freebuff/
+project_archive/
+.vscode/
+.idea/
+.devcontainer/
+.chromium/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.zip
+*.tar.gz
+*.tgz
