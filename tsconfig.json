@@ -26,6 +26,10 @@
   "exclude": [
     "node_modules",
     "dist",
-    "project_archive"
+    "project_archive",
+    "App.tsx",
+    "data.ts",
+    "main.tsx",
+    "types.ts"
   ]
 }

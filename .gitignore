@@ -5,7 +5,7 @@ bun.lockb
 
 # Build outputs
 dist/
-server.js
+/server.js
 
 # Environment variables (firebase / database / api secrets)
 

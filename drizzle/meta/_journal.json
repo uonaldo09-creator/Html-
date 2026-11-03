@@ -29,6 +29,13 @@
       "when": 1791955513000,
       "tag": "0003_identity_subjects",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793318400000,
+      "tag": "0004_review_user_uniqueness",
+      "breakpoints": true
     }
   ]
 }
