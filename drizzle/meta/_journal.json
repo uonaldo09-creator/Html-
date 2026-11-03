@@ -1,0 +1,34 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1782292823847,
+      "tag": "0000_thick_husk",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790616512365,
+      "tag": "0001_session_lifetimes",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791909747000,
+      "tag": "0002_analytics_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791955513000,
+      "tag": "0003_identity_subjects",
+      "breakpoints": true
+    }
+  ]
+}
