@@ -1,0 +1,28 @@
+export const staticUsers = [
+  {
+    id: 1,
+    email: "admin@uninfo.com",
+    password: "",
+    role: "Admin",
+    name: "Admin User",
+    loginFailures: 0,
+    lockedUntil: 0,
+    createdAt: new Date().toISOString(),
+    emailVerified: true,
+    verificationToken: null,
+    verificationExpires: null,
+  },
+  {
+    id: 2,
+    email: "student@uninfo.com",
+    password: "",
+    role: "Student",
+    name: "Test Student",
+    loginFailures: 0,
+    lockedUntil: 0,
+    createdAt: new Date().toISOString(),
+    emailVerified: true,
+    verificationToken: null,
+    verificationExpires: null,
+  },
+];
