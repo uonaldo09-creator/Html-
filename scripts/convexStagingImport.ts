@@ -174,7 +174,9 @@ async function main(): Promise<void> {
         mode === "preflight" ? null : (await destination.listKeys(table)).length;
       perTable.push({
         table,
-        sourceCount: row?.sourceCount ?? 0,
+        sourceCount: mode === "preflight"
+          ? (result.sourceCounts?.[table] ?? 0)
+          : (row?.sourceCount ?? 0),
         inserted: row?.inserted ?? 0,
         plannedInsert: row?.plannedInsert ?? 0,
         alreadyPresent: row?.alreadyPresent ?? 0,

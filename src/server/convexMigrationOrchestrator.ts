@@ -66,6 +66,7 @@ export interface MigrationExecutionResult {
   mode: MigrationMode;
   sourceFingerprint: string;
   issues: ReturnType<typeof validateMigrationSnapshot>;
+  sourceCounts?: Record<SourceTable, number>;
   tables?: MigrationRunResult;
   rollback: "PostgreSQL remains authoritative; no automatic delete or route switch.";
 }
@@ -180,6 +181,9 @@ export async function runConvexMigration(
         mode: options.mode,
         sourceFingerprint: fingerprint,
         issues,
+        sourceCounts: Object.fromEntries(
+          migrationTables.map(({ source: table }) => [table, snapshot[table].length]),
+        ) as Record<SourceTable, number>,
         rollback: "PostgreSQL remains authoritative; no automatic delete or route switch.",
       };
     }
@@ -189,6 +193,58 @@ export async function runConvexMigration(
     if (!destination) throw new Error("Migration destination is required.");
     if (await source.sourceFingerprint() !== fingerprint) {
       throw new Error("Migration source changed during preflight.");
+    }
+
+    // An empty staging destination needs no relationship lookups during dry-run.
+    // Validate transformed source keys and inspect every destination table first.
+    if (options.mode === "dry-run") {
+      const destinationKeyPages = await Promise.all(
+        migrationTables.map(async ({ source: table }) => ({
+          table,
+          keys: await destination.listKeys(table),
+        })),
+      );
+
+      const populated = destinationKeyPages.filter(({ keys }) => keys.length > 0);
+      if (populated.length > 0) {
+        throw new Error(
+          `Safe empty-destination dry-run refused: existing staging keys found: ${
+            populated.map(({ table, keys }) => `${table}=${keys.length}`).join(", ")
+          }.`,
+        );
+      }
+
+      const tables = Object.fromEntries(
+        migrationTables.map(({ source: table }) => {
+          const transformedKeys = snapshot[table].map(
+            (value) => transformPostgresMigrationRecord(table, value).key,
+          );
+
+          if (new Set(transformedKeys).size !== transformedKeys.length) {
+            throw new Error(`Transformed source contains duplicate keys for ${table}.`);
+          }
+
+          return [table, {
+            sourceCount: snapshot[table].length,
+            inserted: 0,
+            plannedInsert: snapshot[table].length,
+            alreadyPresent: 0,
+            verified: 0,
+          }];
+        }),
+      ) as MigrationRunResult;
+
+      if (await source.sourceFingerprint() !== fingerprint) {
+        throw new Error("Migration source changed during dry-run.");
+      }
+
+      return {
+        mode: options.mode,
+        sourceFingerprint: fingerprint,
+        issues,
+        tables,
+        rollback: "PostgreSQL remains authoritative; no automatic delete or route switch.",
+      };
     }
 
     // Raise each counter-backed table's floor before any write, so an ID handed
@@ -217,7 +273,7 @@ export async function runConvexMigration(
     const tables = await runBatchedMigration(composeAdapter(source, destination), {
       batchSize: options.batchSize,
       maxRetries: options.maxRetries,
-      dryRun: options.mode === "dry-run" || options.mode === "verify",
+      dryRun: options.mode === "verify",
     });
     if (
       options.mode === "verify" &&
