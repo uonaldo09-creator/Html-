@@ -102,7 +102,9 @@ Stop if the report shows any error. Do not proceed to `dry-run` or `import`.
 
 ## Step 2 — Destination dry-run (read-only classification)
 
-Dry-run classifies every record against the destination without writing:
+Dry-run is read-only. It first lists keys in all 13 destination tables and
+refuses to proceed if any table is populated. For an empty destination it checks
+transformed source-key uniqueness and reports the planned inserts without writes:
 
 ```bash
 export MIGRATION_MODE=dry-run
@@ -148,7 +150,10 @@ npm run migrate:staging
 ```
 
 Verify re-reads the source and confirms every source key exists in the
-destination, writing nothing. `status` must be `VERIFY_COMPLETE`.
+destination, writing nothing. `status` must be `VERIFY_COMPLETE`. The independent verification records the
+source/destination key classifications and writes nothing. After a successful
+import the empty-destination dry-run is expected to refuse because staging is no
+longer empty; use `verify` for post-import reconciliation.
 
 ## Idempotency
 
@@ -186,17 +191,66 @@ ID locally. It returns the next ID and advances the counter, so it can never
 return a value at or below an imported legacy ID. This function is
 `internalMutation`; ordinary clients cannot call it.
 
+## Actual isolated staging execution — 2026-11-04
+
+Target: isolated Convex staging deployment `confident-oyster-610`
+(`ap-southeast-2`). The source was King PostgreSQL, accessed through the
+read-only migration role. No production route or database was changed.
+
+| Mode | Status | Evidence |
+| --- | --- | --- |
+| `preflight` | `PREFLIGHT_PASS` | 332 source rows across 13 tables |
+| `dry-run` | `DRY_RUN_PLAN_COMPLETE` | Empty destination; 332 planned inserts; no writes |
+| `import` | `STAGING_IMPORT_AND_RECONCILIATION_PASS` | 332 inserted and reconciled; destination key totals match |
+| `verify` | `VERIFY_COMPLETE` | Independent read-only pass: 332 already present and identical; 0 planned inserts |
+
+Import totals: 332 source rows, 332 imported/verified rows, 332 destination keys,
+zero missing keys, zero conflicts, zero validation errors, and zero import
+warnings. Source fingerprint:
+`151c9d246d6b2024bd9ee90d83a1eee37b7d2d437a746ddce590153f805e86eb`.
+
+| Table | Rows |
+| --- | ---: |
+| universities | 31 |
+| users | 13 |
+| studentProfiles | 4 |
+| parentProfiles | 0 |
+| reviews | 157 |
+| bookmarks | 6 |
+| notifications | 4 |
+| chatHistory | 32 |
+| sessions | 0 |
+| auditLogs | 66 |
+| loginAttempts | 19 |
+| universityReviewsAgg | 0 |
+| analyticsEvents | 0 |
+| **Total** | **332** |
+
+The 157 reviews include all 152 repeated-content records with distinct legacy
+IDs. The 32 chat-history rows include all 18 unlinked records, without invented
+user identities. A second live `import` run was not performed; the independent
+read-only `verify` run is the recorded live reconciliation evidence.
+
+The application still uses PostgreSQL. JWT issuer/JWKS provisioning and staging
+application integration remain incomplete. No production cutover was performed.
+
 ## Verification checklist
 
-- [ ] Preflight `status` is `PREFLIGHT_PASS` with no errors.
-- [ ] Dry-run `status` is `DRY_RUN_PLAN_COMPLETE` with no conflicts.
-- [ ] Import `status` is `STAGING_IMPORT_AND_RECONCILIATION_PASS`.
-- [ ] Total source records = 332; total destination keys = 332.
-- [ ] Per table, `sourceCount == verified == destinationKeys`.
-- [ ] Reviews = 157, including all 152 repeated rows.
-- [ ] Chat history = 32, including all 18 unlinked records.
-- [ ] A second import reports `inserted: 0` everywhere.
-- [ ] `npm test`, both TypeScript checks, and `npm run build` pass.
+- [x] Preflight `status` is `PREFLIGHT_PASS`.
+- [x] Empty-destination dry-run `status` is `DRY_RUN_PLAN_COMPLETE` with no conflicts.
+- [x] Import `status` is `STAGING_IMPORT_AND_RECONCILIATION_PASS`.
+- [x] Total source records = 332; total destination keys = 332.
+- [x] Per table, `sourceCount == verified == destinationKeys`.
+- [x] Reviews = 157, including all 152 repeated-content rows.
+- [x] Chat history = 32, including all 18 unlinked records.
+- [x] Independent read-only verify `status` is `VERIFY_COMPLETE`; 332 identical keys, zero conflicts.
+- [ ] A second live import run reporting `inserted: 0` everywhere. (Not run; do not claim it.)
+- [x] Backend/Convex/frontend TypeScript checks pass.
+- [x] `npm test`: 190 tests across 26 files pass.
+- [x] `npm run build` passes. Vite reports one non-blocking 529 KB chunk-size advisory (>500 KB).
+- [ ] Provision real HTTPS JWT issuer and JWKS endpoint; configure matching Express and Convex issuer/audience.
+- [ ] Run staging browser/auth integration and protected-query tests, including negative JWT and token-version-revocation cases.
+- [x] Confirm production remains on PostgreSQL and no cutover/routing switch occurred.
 
 ## What this runbook does not do
 

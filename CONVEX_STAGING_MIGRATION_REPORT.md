@@ -1,8 +1,10 @@
 # UniInfo: King → isolated Convex staging migration report
 
-Status: **implementation and local rehearsal complete; the real staging import is
-blocked on missing credentials.** No production cutover was performed. No
-production or shared deployment was written to.
+Status: **isolated Convex staging data import and independent verification complete.**
+The 332-row King snapshot was imported and reconciled in the dedicated staging
+deployment on 2026-11-04. Production remains on PostgreSQL; no production cutover
+or production/shared-deployment write was performed. Application JWT authentication
+and end-to-end staging integration remain open.
 
 ## What was delivered
 
@@ -104,6 +106,52 @@ The source-only preflight also ran end to end against the same container and
 reported `PREFLIGHT_PASS` with zero errors and one pre-approved warning
 (`unresolved_optional_relationship` for unlinked chat).
 
+## Live isolated staging execution — 2026-11-04
+
+The real King source was read through the read-only migration connection and
+imported into the isolated Convex staging deployment `confident-oyster-610`
+(`ap-southeast-2`). The source PostgreSQL project was not modified.
+
+| Check | Result |
+| --- | --- |
+| Source preflight | `PREFLIGHT_PASS` |
+| Empty-destination dry-run | `DRY_RUN_PLAN_COMPLETE`; 332 planned inserts |
+| Import and reconciliation | `STAGING_IMPORT_AND_RECONCILIATION_PASS` |
+| Independent read-only verification | `VERIFY_COMPLETE` |
+| Source rows | 332 across 13 tables |
+| Imported / destination keys | 332 / 332 |
+| Missing keys / conflicts | 0 / 0 |
+| Validation errors / import warnings | 0 / 0 |
+| Independent verify classification | 332 already present and identical; 0 planned inserts |
+| Source fingerprint | `151c9d246d6b2024bd9ee90d83a1eee37b7d2d437a746ddce590153f805e86eb` |
+
+| Table | Source rows | Imported / verified | Destination keys |
+| --- | ---: | ---: | ---: |
+| universities | 31 | 31 | 31 |
+| users | 13 | 13 | 13 |
+| studentProfiles | 4 | 4 | 4 |
+| parentProfiles | 0 | 0 | 0 |
+| reviews | 157 | 157 | 157 |
+| bookmarks | 6 | 6 | 6 |
+| notifications | 4 | 4 | 4 |
+| chatHistory | 32 | 32 | 32 |
+| sessions | 0 | 0 | 0 |
+| auditLogs | 66 | 66 | 66 |
+| loginAttempts | 19 | 19 | 19 |
+| universityReviewsAgg | 0 | 0 | 0 |
+| analyticsEvents | 0 | 0 | 0 |
+| **Total** | **332** | **332** | **332** |
+
+All 157 review rows were preserved, including 152 repeated-content records
+with distinct legacy IDs. All 32 chat-history rows were preserved, including
+18 unlinked records; no user identity was invented. The independent `verify`
+run re-read the source and found all 332 destination keys identical. A second
+live `import` invocation was not performed; the independent read-only verify
+is the recorded live idempotency/reconciliation evidence.
+
+The isolated staging import did not switch application routes. PostgreSQL remains
+the authoritative production datastore. No production deployment was written to.
+
 ## Verification
 
 - `npm test`: 190 tests across 26 files, all passing.
@@ -112,33 +160,33 @@ reported `PREFLIGHT_PASS` with zero errors and one pre-approved warning
 
 ## Remaining blockers
 
-The real staging import could not be executed because none of the required
-credentials are present in this environment:
+The database import and independent reconciliation are complete. The remaining
+application-level blocker is live JWT authentication and browser/application
+integration. The repository's bridge code requires a real, publicly reachable
+HTTPS issuer that serves `/.well-known/jwks.json`, a matching Convex issuer and
+audience, and a backend-only P-256/ES256 private key. No real issuer endpoint has
+been provisioned or verified. Do not substitute `https://auth.uniinfo.test`,
+disable JWT validation, or set `providers: []` to bypass authentication.
 
-| Variable | State |
-| --- | --- |
-| `KING_DATABASE_URL` | unset |
-| `CONVEX_STAGING_URL` | unset |
-| `CONVEX_STAGING_DEPLOY_KEY` | unset |
-| `CONVEX_DEPLOY_KEY` | unset |
-| `STAGING_DATABASE_URL` | unset |
-
-Because the destination deployment does not exist in this environment, there is
-no way to confirm the real per-table destination counts, the 152 repeated
-reviews, or the 18 unlinked chat rows **in the real staging deployment**. Those
-figures above come from the rehearsal, not from a live staging deployment.
+The local commit `2ecbc73` contains the migration preflight reporting and safe
+dry-run fixes; it has been committed in the Fedora checkout but was not pushed
+to GitHub at the time this report was prepared. GitHub repository write access
+was unavailable to the connected integration (HTTP 403), so the user must push
+from the authorized local checkout.
 
 ## Exact remaining work
 
-1. Register `KING_DATABASE_URL`, `CONVEX_STAGING_URL`, and
-   `CONVEX_STAGING_DEPLOY_KEY` (and, for `import`, `ALLOW_STAGING_IMPORT`).
-2. Provision the isolated staging Convex deployment and deploy the current
-   `convex/schema.ts` to it.
-3. Run `MIGRATION_MODE=preflight`, then `dry-run`, then `import`, then `verify`
-   per `CONVEX_STAGING_MIGRATION_RUNBOOK.md`. Expect 332 rows across 13 tables,
-   157 reviews, and 32 chat rows.
-4. Application integration: point a non-production environment at the staging
-   deployment and exercise the auth bridge, catalog reads, and writes.
-5. Production cutover (out of scope here): provision the production deployment,
-   rehearse against a fresh staging clone, schedule an explicit change window,
-   execute, verify, then retire PostgreSQL.
+1. Push local commit `2ecbc73` from the authorized Fedora checkout, then commit
+   these report/runbook updates.
+2. Provision a real HTTPS staging issuer/JWKS endpoint and set matching
+   `CONVEX_AUTH_ISSUER` and `CONVEX_AUTH_AUDIENCE` values in Express and the
+   isolated Convex deployment. Keep `CONVEX_AUTH_PRIVATE_KEY` backend-only.
+3. Run staging-only auth and application integration tests: successful verified
+   session token exchange and protected `me` query; JWKS key match; rejection of
+   invalid signature, issuer, audience, expiry, disabled user, and stale token
+   version; then catalog reads and a controlled synthetic write/readback.
+4. Update this report with test evidence and the published commit/PR references.
+
+Production cutover remains out of scope. PostgreSQL must remain authoritative
+until a separate production migration plan, backup/restore rehearsal, approval,
+and explicit change window are completed.
