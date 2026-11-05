@@ -36,7 +36,69 @@ reproduce those commits byte-for-byte.
 9. `university_reviews_agg` is empty despite 157 reviews across five universities (aggregate drift; migration/recomputation policy requires product sign-off).
 10. Live `users.firebase_uid` and `users.sync_version` columns exist in PostgreSQL but are **absent from `src/db/schema.ts`**; their current live values are empty/zero. Schema reconciliation is documentation/remediation only — no live schema/data changes.
 11. `analytics_events.id` is **identity-generated** in PostgreSQL but is not modeled as generated in Drizzle. Migration reads/imports legacy IDs read-only; no sequence/identity mutation performed.
-12. `bookmarks` has maximum existing row ID **6** but PostgreSQL sequence high-water **232**. Reserving Convex ID counters from `max(legacyId)+1` alone is **insufficient** and can reuse previously allocated PostgreSQL IDs; code remediation is implemented on `fix/migration-id-counter-sequence-floor` (fail-closed, read-only sequence metadata). For a future approved real-data migration reader, minimum access is read-only inspection of the source rows plus catalog visibility for `pg_get_serial_sequence()`/`pg_sequence` metadata (for example `SELECT` on relevant source tables; no `nextval()`/`setval()` and no sequence mutation privileges). If metadata cannot be read, the import must fail closed.
+12. `bookmarks` has maximum existing row ID **6** but PostgreSQL sequence high-water **232**. Reserving Convex ID counters from `max(legacyId)+1` alone is **insufficient** and can reuse previously allocated PostgreSQL IDs; code remediation is implemented on `fix/migration-id-counter-sequence-floor` (fail-closed, read-only sequence metadata).
+
+### 1.2 Approved migration-reader permissions (documentation only; do not execute on King)
+
+**[PRODUCT/SECURITY/DATA-OWNER SIGN-OFF REQUIRED]** For a future approved real-data migration reader, grant the minimum read-only access needed to inspect rows and sequence state:
+
+- `SELECT` on the 13 mapped application tables.
+- `USAGE` on the `public` schema.
+- `SELECT` on the associated mapped sequences needed to inspect sequence state (required because PostgreSQL can report `last_value` as `NULL` both for an unused sequence and when the current role lacks `SELECT`/`USAGE` visibility; the reader must distinguish these cases and fail closed).
+- **No** `USAGE` or `UPDATE` on sequences.
+- **No** `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `CREATE`, role-management, or elevated privileges.
+- **No** `BYPASSRLS`.
+- **No** `nextval()`, `currval()`, or `setval()` calls during source inspection.
+
+Reviewed SQL example for the database owner (grant on mapped sequence objects only; **do not execute against King in this task**):
+
+```sql
+-- Example only. Review, adapt role/schema names, and execute only with explicit approval.
+GRANT USAGE ON SCHEMA public TO migration_reader_role;
+GRANT SELECT ON TABLE
+  public.users,
+  public.universities,
+  public.sessions,
+  public.reviews,
+  public.bookmarks,
+  public.chat_history,
+  public.audit_logs,
+  public.analytics_events,
+  public.login_attempts,
+  public.student_profiles,
+  public.parent_profiles,
+  public.notifications,
+  public.university_reviews_agg
+TO migration_reader_role;
+GRANT SELECT ON SEQUENCE
+  public.users_id_seq,
+  public.reviews_id_seq,
+  public.bookmarks_id_seq,
+  public.chat_history_id_seq,
+  public.audit_logs_id_seq,
+  public.login_attempts_id_seq,
+  public.student_profiles_id_seq,
+  public.parent_profiles_id_seq,
+  public.notifications_id_seq,
+  public.analytics_events_id_seq
+TO migration_reader_role;
+-- Do not grant access to unmapped account_sync_outbox or its sequence.
+```
+
+If sequence metadata cannot be read with confirmed `SELECT` privilege, the import must fail closed and never interpret missing permission as an unused sequence.
+
+### 1.3 Production cutover safety for sequence high-water
+
+A sequence high-water read is **not** a permanent reservation against future PostgreSQL writes. A staging rehearsal does **not** approve production cutover.
+
+Before a production domain is switched to Convex:
+1. Quiesce writes for that domain.
+2. Perform the final PostgreSQL snapshot and sequence high-water inspection.
+3. Reserve the Convex counter floor from the final inspected values.
+4. Complete final reconciliation.
+5. Switch writes only after verification.
+
+
 
 **Privacy/safety:** no personal information, credentials, password hashes, session tokens, or private record contents were recorded in this audit update.
 

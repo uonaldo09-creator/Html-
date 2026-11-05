@@ -26,7 +26,17 @@ const sqlTables: Record<string, string> = {
 
 class SyntheticReadOnlyPgClient {
   readonly statements: string[] = [];
-  readonly sequenceByTable: Record<string, { last_value: string | number; is_called: boolean; seqincrement?: number } | null> = {};
+  readonly sequenceByTable: Record<string, {
+    last_value: string | number | null;
+    is_called: boolean;
+    seqstart?: number;
+    seqincrement?: number;
+    seqmin?: number;
+    seqmax?: number;
+    seqcache?: number;
+    seqcycle?: boolean;
+    can_select?: boolean;
+  } | null> = {};
   sequenceQueryError: Error | null = null;
   readonly rows: Record<string, Record<string, unknown>[]> = {
     universities: [],
@@ -59,14 +69,24 @@ class SyntheticReadOnlyPgClient {
     if (text.startsWith("BEGIN") || text === "COMMIT") return { rows: [] };
     if (text.includes("pg_get_serial_sequence")) {
       if (this.sequenceQueryError) throw this.sequenceQueryError;
+      if (/nextval|currval|setval/i.test(text)) {
+        throw new Error("Source inspection must not call nextval/currval/setval.");
+      }
       const tableName = String(values[0]).replace(/^public\./, "");
       const sequence = this.sequenceByTable[tableName];
       if (!sequence) return { rows: [] };
       return {
         rows: [{
+          seq_name: `public.${tableName}_id_seq`,
           last_value: sequence.last_value,
           is_called: sequence.is_called,
+          seqstart: sequence.seqstart ?? 1,
           seqincrement: sequence.seqincrement ?? 1,
+          seqmin: sequence.seqmin ?? 1,
+          seqmax: sequence.seqmax ?? 2147483647,
+          seqcache: sequence.seqcache ?? 1,
+          seqcycle: sequence.seqcycle ?? false,
+          can_select: sequence.can_select ?? true,
         }],
       };
     }
@@ -273,10 +293,10 @@ describe("PostgresMigrationSource", () => {
 });
 
 
-  it("reads sequence-aware ID counter floors without using nextval/setval (bookmarks 6/232)", async () => {
+  it("reads sequence-aware ID counter floors without using nextval/currval/setval (bookmarks 6/232)", async () => {
     const client = new SyntheticReadOnlyPgClient();
     client.rows.bookmarks = [{ id: 6, user_email: "a@example.test", university_id: 1 }];
-    client.sequenceByTable.bookmarks = { last_value: 232, is_called: true, seqincrement: 1 };
+    client.sequenceByTable.bookmarks = { last_value: 232, is_called: true, seqincrement: 1, can_select: true };
     const source = new PostgresMigrationSource(client);
     await source.beginReadOnlySnapshot();
 
@@ -284,22 +304,89 @@ describe("PostgresMigrationSource", () => {
       maxLegacyId: 6,
       sequenceNextId: 233,
     });
-    expect(client.statements.some((s) => /nextval|setval/i.test(s))).toBe(false);
+    expect(client.statements.some((s) => /nextval|currval|setval/i.test(s))).toBe(false);
+    expect(client.statements.some((s) => s.includes("has_sequence_privilege"))).toBe(true);
     await source.close();
   });
 
-  it("handles unused sequences and tables without sequences", async () => {
+  it("treats a genuinely unused sequence as start_value only when SELECT permission is confirmed", async () => {
     const client = new SyntheticReadOnlyPgClient();
     client.rows.reviews = [];
-    client.sequenceByTable.reviews = { last_value: 1, is_called: false, seqincrement: 1 };
-    client.rows.auditLogs = [];
+    client.sequenceByTable.reviews = {
+      last_value: null,
+      is_called: false,
+      seqstart: 7,
+      seqincrement: 1,
+      can_select: true,
+    };
     const source = new PostgresMigrationSource(client);
     await source.beginReadOnlySnapshot();
 
     await expect(source.readIdCounterFloor("reviews")).resolves.toEqual({
       maxLegacyId: 0,
-      sequenceNextId: 1,
+      sequenceNextId: 7,
     });
+    await source.close();
+  });
+
+  it("fails closed when last_value is NULL because SELECT permission is missing", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.reviews = [];
+    client.sequenceByTable.reviews = {
+      last_value: null,
+      is_called: false,
+      seqstart: 1,
+      seqincrement: 1,
+      can_select: false,
+    };
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+
+    await expect(source.readIdCounterFloor("reviews")).rejects.toThrow(
+      /Missing SELECT privilege|unused sequence|failing closed/i,
+    );
+    await source.close();
+  });
+
+  it("succeeds with SELECT on the sequence even without USAGE/UPDATE", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.bookmarks = [{ id: 6 }];
+    client.sequenceByTable.bookmarks = {
+      last_value: 232,
+      is_called: true,
+      seqincrement: 1,
+      can_select: true,
+      // USAGE/UPDATE not modeled or required by inspection.
+    };
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+    await expect(source.readIdCounterFloor("bookmarks")).resolves.toEqual({
+      maxLegacyId: 6,
+      sequenceNextId: 233,
+    });
+    expect(client.statements.some((s) => /USAGE|UPDATE/i.test(s))).toBe(false);
+    await source.close();
+  });
+
+  it("fails closed for invalid increment or cycling sequences", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.users = [];
+    client.sequenceByTable.users = { last_value: 1, is_called: true, seqincrement: 0, can_select: true };
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+    await expect(source.readIdCounterFloor("users")).rejects.toThrow(/invalid|unsupported|failing closed/i);
+
+    client.sequenceByTable.users = { last_value: 1, is_called: true, seqincrement: 1, seqcycle: true, can_select: true };
+    await expect(source.readIdCounterFloor("users")).rejects.toThrow(/Cycling sequence|failing closed/i);
+    await source.close();
+  });
+
+  it("handles tables without associated sequences and token-keyed tables", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.auditLogs = [];
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+
     await expect(source.readIdCounterFloor("auditLogs")).resolves.toEqual({
       maxLegacyId: 0,
       sequenceNextId: null,
@@ -307,6 +394,26 @@ describe("PostgresMigrationSource", () => {
     await expect(source.readIdCounterFloor("sessions")).resolves.toEqual({
       maxLegacyId: 0,
       sequenceNextId: null,
+    });
+    await source.close();
+  });
+
+  it("reserves beyond a cached sequence high-water boundary", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.bookmarks = [{ id: 6 }];
+    // PostgreSQL can report last_value ahead of recently returned nextval() due to cache.
+    client.sequenceByTable.bookmarks = {
+      last_value: 232,
+      is_called: true,
+      seqincrement: 1,
+      seqcache: 50,
+      can_select: true,
+    };
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+    await expect(source.readIdCounterFloor("bookmarks")).resolves.toEqual({
+      maxLegacyId: 6,
+      sequenceNextId: 233,
     });
     await source.close();
   });
@@ -319,7 +426,8 @@ describe("PostgresMigrationSource", () => {
     await source.beginReadOnlySnapshot();
 
     await expect(source.readIdCounterFloor("bookmarks")).rejects.toThrow(
-      /sequence metadata|Failing closed|pg_get_serial_sequence|no nextval\/setval/i,
+      /sequence metadata|Failing closed|SELECT on the mapped source table|no nextval\/currval\/setval/i,
     );
+    expect(client.statements.every((s) => !/nextval|currval|setval/i.test(s))).toBe(true);
     await source.close();
   });

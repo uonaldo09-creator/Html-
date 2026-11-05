@@ -669,3 +669,14 @@ describe("migration functions stay internal-only", () => {
     ).rejects.toThrow(/sequence metadata|read-only/i);
     expect(destination.insertCalls).toBe(0);
   });
+
+
+  it("reserves a conservative cached-sequence floor during orchestration", async () => {
+    const snapshot = kingSnapshot();
+    snapshot.bookmarks = [{ id: 6, userEmail: "student@king.test", universityId: 1, createdAt }];
+    // Cached/high-water boundary already reported by PostgreSQL.
+    const source = new KingSource(snapshot, { bookmarks: 233 });
+    const destination = new StagingDestination();
+    await runConvexMigration(source, destination, IMPORT_OPTIONS);
+    expect(destination.counters.get("bookmarks")).toBe(233);
+  });
