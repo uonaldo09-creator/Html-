@@ -11,6 +11,10 @@ import {
   type SourceTable,
 } from "./convexMigration";
 import type { MigrationDestination } from "./convexMigrationDestination";
+import {
+  assertConvexDeploymentAllowed,
+  type ConvexDeploymentRole,
+} from "./convexDeploymentTarget";
 import { transformPostgresMigrationRecord } from "./convexMigrationTransform";
 
 export type MigrationMode =
@@ -71,7 +75,18 @@ export interface MigrationExecutionResult {
   rollback: "PostgreSQL remains authoritative; no automatic delete or route switch.";
 }
 
-const CURRENT_DEVELOPMENT_DEPLOYMENT = "graceful-kangaroo-272";
+function isAllowedMigrationDestination(
+  deploymentName: string | undefined,
+  role: ConvexDeploymentRole,
+): boolean {
+  if (!deploymentName) return false;
+  try {
+    assertConvexDeploymentAllowed(deploymentName, role);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function readCompleteSnapshot(
   source: MigrationSource,
@@ -144,9 +159,10 @@ export async function runConvexMigration(
     (source.kind !== "synthetic" ||
       !destination ||
       !options.confirmSyntheticImport ||
-      !options.isolatedSyntheticDeployment ||
-      options.isolatedSyntheticDeployment === CURRENT_DEVELOPMENT_DEPLOYMENT ||
-      options.isolatedSyntheticDeployment === "prod")
+      !isAllowedMigrationDestination(
+        options.isolatedSyntheticDeployment,
+        "synthetic-migration",
+      ))
   ) {
     throw new Error("Synthetic writes require a confirmed isolated synthetic source and destination.");
   }
@@ -155,10 +171,10 @@ export async function runConvexMigration(
     (source.kind !== "postgres" ||
       !destination ||
       !options.confirmPostgresImport ||
-      !options.isolatedStagingDeployment ||
-      options.isolatedStagingDeployment === CURRENT_DEVELOPMENT_DEPLOYMENT ||
-      options.isolatedStagingDeployment === "clear-gopher-925" ||
-      options.isolatedStagingDeployment === "prod")
+      !isAllowedMigrationDestination(
+        options.isolatedStagingDeployment,
+        "real-data-migration",
+      ))
   ) {
     throw new Error("Real-data imports require a confirmed read-only PostgreSQL source and isolated staging destination.");
   }

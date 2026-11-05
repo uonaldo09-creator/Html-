@@ -5,6 +5,11 @@ import type {
   SourceTable,
 } from "./convexMigration";
 import { migrationTables } from "./convexMigration";
+import {
+  assertConvexDeploymentAllowed,
+  resolveConvexDeploymentTarget,
+  type ConvexDeploymentTarget,
+} from "./convexDeploymentTarget";
 
 declare module "convex/browser" {
   interface ConvexHttpClient {
@@ -15,20 +20,6 @@ declare module "convex/browser" {
   }
 }
 
-const CURRENT_DEVELOPMENT_DEPLOYMENT = "graceful-kangaroo-272";
-/**
- * Deployments that must never receive any migration writes: the existing
- * development deployment and production.
- */
-const PROTECTED_DESTINATIONS = new Set([
-  "prod",
-  "graceful-kangaroo-272",
-]);
-/**
- * The synthetic rehearsal deployment. It is allowed only for synthetic
- * rehearsals and must never receive migrated real data.
- */
-const SYNTHETIC_ONLY_DESTINATION = "clear-gopher-925";
 const TABLE_MUTATIONS: Record<SourceTable, string> = {
   universities: "migration:migrateUniversities",
   users: "migration:migrateUsers",
@@ -93,42 +84,29 @@ export class ConvexInternalHttpTransport implements InternalMigrationTransport {
     isolatedSyntheticConfirmed?: boolean;
     isolatedStagingConfirmed?: boolean;
   }): ConvexInternalHttpTransport {
-    const parsed = new URL(options.url);
-    const hostname = parsed.hostname.split(".");
-    const matchesDeployment =
-      (hostname.length === 3 &&
-        hostname[0] === options.deploymentName &&
-        hostname[1] === "convex" &&
-        hostname[2] === "cloud") ||
-      (hostname.length === 4 &&
-        hostname[0] === options.deploymentName &&
-        /^[a-z]{2,}(?:-[a-z0-9]+)+$/.test(hostname[1]) &&
-        hostname[2] === "convex" &&
-        hostname[3] === "cloud");
-    // A synthetic rehearsal and a real staging import are distinct roles. Each
-    // must be positively confirmed. Neither may name the existing dev target or
-    // prod; a staging (real-data) target may additionally never be the synthetic
-    // rehearsal deployment.
-    const confirmedRole = options.isolatedSyntheticConfirmed
-      ? "synthetic"
-      : options.isolatedStagingConfirmed
-        ? "staging"
-        : null;
-    if (
-      parsed.protocol !== "https:" ||
-      parsed.port !== "" ||
-      !matchesDeployment ||
-      !options.deploymentName ||
-      PROTECTED_DESTINATIONS.has(options.deploymentName) ||
-      (confirmedRole === "staging" && options.deploymentName === SYNTHETIC_ONLY_DESTINATION) ||
-      confirmedRole === null ||
-      !options.adminKey
-    ) {
+    const syntheticConfirmed = options.isolatedSyntheticConfirmed === true;
+    const stagingConfirmed = options.isolatedStagingConfirmed === true;
+    if (syntheticConfirmed === stagingConfirmed || !options.adminKey?.trim()) {
       throw new Error("Convex migration destination is not positively identified as an isolated target.");
     }
-    const client = new ConvexHttpClient(parsed.origin, { logger: false });
+
+    let target: ConvexDeploymentTarget;
+    try {
+      target = resolveConvexDeploymentTarget({
+        deploymentName: options.deploymentName,
+        url: options.url,
+        role: syntheticConfirmed ? "synthetic-migration" : "real-data-migration",
+      });
+    } catch (error) {
+      throw new Error(
+        "Convex migration destination is not positively identified as an isolated target.",
+        { cause: error },
+      );
+    }
+
+    const client = new ConvexHttpClient(target.url, { logger: false });
     client.setAdminAuth(options.adminKey);
-    return new ConvexInternalHttpTransport(client, options.deploymentName);
+    return new ConvexInternalHttpTransport(client, target.deploymentName);
   }
 
   async invoke<T>(functionName: string, args: Record<string, unknown>): Promise<T> {
@@ -141,11 +119,16 @@ export class ConvexMigrationDestination implements MigrationDestination {
     private readonly transport: InternalMigrationTransport,
     expectedIsolatedDeployment: string,
   ) {
-    if (
-      !expectedIsolatedDeployment ||
-      expectedIsolatedDeployment !== transport.deploymentName ||
-      PROTECTED_DESTINATIONS.has(expectedIsolatedDeployment)
-    ) {
+    let expectedDeployment: string;
+    try {
+      expectedDeployment = assertConvexDeploymentAllowed(
+        expectedIsolatedDeployment,
+        "synthetic-migration",
+      );
+    } catch {
+      throw new Error("Convex migration destination does not match the isolated deployment identity.");
+    }
+    if (expectedDeployment !== transport.deploymentName) {
       throw new Error("Convex migration destination does not match the isolated deployment identity.");
     }
   }

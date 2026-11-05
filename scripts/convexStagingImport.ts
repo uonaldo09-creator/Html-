@@ -12,6 +12,7 @@ import {
   type MigrationExecutionOptions,
   type MigrationMode,
 } from "../src/server/convexMigrationOrchestrator";
+import { resolveConvexDeploymentTarget } from "../src/server/convexDeploymentTarget";
 
 /**
  * Real-data import runner: reads the confirmed read-only PostgreSQL source
@@ -26,11 +27,6 @@ import {
 type RunnerMode = "preflight" | "dry-run" | "import" | "verify";
 
 const CONFIRMATION = "IMPORT_KING_INTO_ISOLATED_CONVEX_STAGING";
-const PROTECTED_DEPLOYMENTS = new Set([
-  "prod",
-  "graceful-kangaroo-272",
-  "clear-gopher-925",
-]);
 
 function requiredEnv(name: string): string {
   const value = process.env[name]?.trim();
@@ -44,31 +40,20 @@ function redact(value: string): string {
 
 function parseStagingTarget(): { deploymentName: string; url: string } {
   const raw = requiredEnv("CONVEX_STAGING_URL");
-  const parsed = new URL(raw);
-  const hostname = parsed.hostname.split(".");
-  const deploymentName = hostname[0] ?? "";
-  const matchesDeployment =
-    (hostname.length === 3 &&
-      hostname[1] === "convex" &&
-      hostname[2] === "cloud") ||
-    (hostname.length === 4 &&
-      /^[a-z]{2,}(?:-[a-z0-9]+)+$/.test(hostname[1] ?? "") &&
-      hostname[2] === "convex" &&
-      hostname[3] === "cloud");
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.port !== "" ||
-    parsed.username ||
-    parsed.password ||
-    parsed.search ||
-    parsed.hash ||
-    !matchesDeployment ||
-    !deploymentName ||
-    PROTECTED_DEPLOYMENTS.has(deploymentName)
-  ) {
-    throw new Error("CONVEX_STAGING_URL is not an isolated, positively identified staging deployment.");
+  try {
+    const deploymentName = new URL(raw).hostname.split(".")[0] ?? "";
+    const target = resolveConvexDeploymentTarget({
+      deploymentName,
+      url: raw,
+      role: "real-data-migration",
+    });
+    return { deploymentName: target.deploymentName, url: target.url };
+  } catch (error) {
+    throw new Error(
+      "CONVEX_STAGING_URL is not an isolated, positively identified staging deployment.",
+      { cause: error },
+    );
   }
-  return { deploymentName, url: parsed.origin };
 }
 
 function parseMode(): RunnerMode {

@@ -2,32 +2,38 @@ import { ConvexHttpClient } from "convex/browser";
 import type { FunctionReturnType } from "convex/server";
 import { api } from "../../convex/_generated/api";
 import type { UniversityDb } from "../db/types";
-
-const UNIINFO_DEV_DEPLOYMENT = "dev:clear-gopher-925";
-const UNIINFO_DEV_HOST = "clear-gopher-925.ap-southeast-2.convex.cloud";
+import { resolveConvexDeploymentTarget } from "./convexDeploymentTarget";
 
 type UniversityPage = FunctionReturnType<typeof api.universities.list>;
 type ConvexUniversity = UniversityPage["page"][number];
 
-let client: ConvexHttpClient | undefined;
+const clients = new Map<string, ConvexHttpClient>();
 
 export function useConvexUniversityCatalog(): boolean {
   return process.env.UNIINFO_CATALOG_BACKEND === "convex";
 }
 
+export function resetConvexUniversityCatalogClientCache(): void {
+  clients.clear();
+}
+
 function getClient(): ConvexHttpClient {
   const deployment = process.env.UNIINFO_CONVEX_DEPLOYMENT?.trim();
-  const url = process.env.UNIINFO_CONVEX_URL;
-  if (deployment !== UNIINFO_DEV_DEPLOYMENT || !url) {
-    throw new Error("UniInfo Convex catalog requires its dedicated development deployment.");
+  const url = process.env.UNIINFO_CONVEX_URL?.trim();
+  if (!deployment || !url) {
+    throw new Error("UniInfo Convex catalog requires an explicitly configured deployment and URL.");
   }
 
-  const parsedUrl = new URL(url);
-  if (parsedUrl.protocol !== "https:" || parsedUrl.hostname !== UNIINFO_DEV_HOST) {
-    throw new Error("UniInfo Convex catalog URL does not match its dedicated development deployment.");
+  const target = resolveConvexDeploymentTarget({
+    deploymentName: deployment,
+    url,
+    role: "catalog-read",
+  });
+  let client = clients.get(target.url);
+  if (!client) {
+    client = new ConvexHttpClient(target.url, { logger: false });
+    clients.set(target.url, client);
   }
-
-  client ??= new ConvexHttpClient(parsedUrl.origin, { logger: false });
   return client;
 }
 
