@@ -38,6 +38,19 @@ reproduce those commits byte-for-byte.
 11. `analytics_events.id` is **identity-generated** in PostgreSQL but is not modeled as generated in Drizzle. Migration reads/imports legacy IDs read-only; no sequence/identity mutation performed.
 12. `bookmarks` has maximum existing row ID **6** but PostgreSQL sequence high-water **232**. Reserving Convex ID counters from `max(legacyId)+1` alone is **insufficient** and can reuse previously allocated PostgreSQL IDs; code remediation is implemented on `fix/migration-id-counter-sequence-floor` (fail-closed, read-only sequence metadata).
 
+
+### 1.4 Sequence-floor semantics (implemented, locally validated)
+
+- `MigrationIdCounterFloor.sequenceNextId` means the **next safe allocation boundary** for future Convex legacy-style ID allocation for a counter-backed table (the value at/above which Convex may allocate without colliding with PostgreSQL source history). It is computed from read-only catalog/runtime state, never from `nextval/currval/setval`.
+- Catalog config is read via `PostgresMigrationSource.SEQUENCE_METADATA_SQL` (`pg_get_serial_sequence` + `pg_class`/`pg_namespace`/`pg_sequence`, including `has_sequence_privilege(current_user, sequence_oid, 'SELECT')`). Runtime state (`last_value`, `is_called`) is read from the catalog-derived sequence relation **only after confirmed SELECT privilege**.
+- If `is_called=false`: `sequenceNextId = start_value` (genuinely unused boundary).
+- If `is_called=true` and `last_value` is present: `sequenceNextId = last_value + increment` (conservative; `last_value` may exceed the most recently returned `nextval()` because of cache reservations).
+- If SELECT privilege is missing, metadata/state is incomplete, sequence cycles, increment/bounds/cache/overflow are unsafe, or identifiers are unexpected: **fail closed**.
+- Tables without an associated sequence/identity generator (and token-keyed/aggregate special cases where applicable) preserve `sequenceNextId = null`; orchestrator still applies `max(existing legacy row IDs)+1` lower bounds.
+- Bookmarks expected floor remains **233** for max row 6 / high-water 232.
+
+**PostgreSQL 17 integration verification status:** automated real-PG17 integration test is present (`src/tests/postgresSequenceMetadata.pg17.integration.test.ts`) and executes `PostgresMigrationSource`’s actual SQL/read path, but it is **skipped in this environment** because no disposable, non-production PostgreSQL 17+ admin/test connection was available (`ALLOW_POSTGRES_17_INTEGRATION_TESTS`/`POSTGRES_TEST_ADMIN_URL` not configured; local psql is 18 client tooling but no accessible disposable test DB/credentials). Docker is installed but not accessible to this session. The invalid `pg_sequence.last_value/is_called` selection has been removed; remaining real-catalog proof requires running that integration test against a disposable PostgreSQL 17 instance.
+
 ### 1.2 Approved migration-reader permissions (documentation only; do not execute on King)
 
 **[PRODUCT/SECURITY/DATA-OWNER SIGN-OFF REQUIRED]** For a future approved real-data migration reader, grant the minimum read-only access needed to inspect rows and sequence state:
