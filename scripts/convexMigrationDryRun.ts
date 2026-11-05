@@ -6,6 +6,7 @@ import { PostgresMigrationSource } from "../src/server/postgresMigrationSource";
 import { validateBackupEncryptionConfig } from "../src/server/backupEncryption";
 import { ConvexInternalHttpTransport, ConvexMigrationDestination, type MigrationDestination } from "../src/server/convexMigrationDestination";
 import { runConvexMigration } from "../src/server/convexMigrationOrchestrator";
+import { resolveConvexDeploymentTarget } from "../src/server/convexDeploymentTarget";
 
 const TARGET_NAME = "groovy-zebra-380";
 const TARGET_URL = "https://groovy-zebra-380.ap-southeast-2.convex.cloud";
@@ -84,10 +85,13 @@ async function main(): Promise<void> {
     throw new Error("Refusing connection: the source is not the approved loopback V5 database.");
   }
 
-  if (
-    new URL(TARGET_URL).hostname !== `${TARGET_NAME}.ap-southeast-2.convex.cloud` ||
-    ["prod", "graceful-kangaroo-272"].includes(TARGET_NAME)
-  ) {
+  try {
+    resolveConvexDeploymentTarget({
+      deploymentName: TARGET_NAME,
+      url: TARGET_URL,
+      role: "synthetic-migration",
+    });
+  } catch {
     throw new Error("Refusing target: the Convex deployment is not positively identified as isolated.");
   }
 

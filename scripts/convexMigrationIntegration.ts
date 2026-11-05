@@ -19,6 +19,7 @@ import {
   runConvexMigration,
   type MigrationSource,
 } from "../src/server/convexMigrationOrchestrator";
+import { resolveConvexDeploymentTarget } from "../src/server/convexDeploymentTarget";
 import { transformPostgresMigrationRecord } from "../src/server/convexMigrationTransform";
 
 const TEST_DEPLOYMENT = "clear-gopher-925";
@@ -253,10 +254,22 @@ function assertTestDeploymentIdentity() {
   const deploymentSelection = process.env.CONVEX_DEPLOYMENT?.split("#", 1)[0]?.trim();
   const url = process.env.VITE_CONVEX_URL;
   const adminKey = process.env.CONVEX_DEPLOY_KEY;
+  let targetAllowed = false;
+  try {
+    if (url) {
+      resolveConvexDeploymentTarget({
+        deploymentName: TEST_DEPLOYMENT,
+        url,
+        role: "synthetic-migration",
+      });
+      targetAllowed = true;
+    }
+  } catch {
+    targetAllowed = false;
+  }
   if (
     deploymentSelection !== `dev:${TEST_DEPLOYMENT}` ||
-    !url ||
-    new URL(url).hostname !== `${TEST_DEPLOYMENT}.ap-southeast-2.convex.cloud` ||
+    !targetAllowed ||
     !process.env.VITE_CONVEX_SITE_URL ||
     !new RegExp(`^${TEST_DEPLOYMENT}\\.[a-z0-9-]+\\.convex\\.site$`).test(
       new URL(process.env.VITE_CONVEX_SITE_URL).hostname,

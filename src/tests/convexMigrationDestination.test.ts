@@ -142,6 +142,18 @@ describe("Convex destination identity guards", () => {
     })).toThrow(/isolated target/);
   });
 
+  it("refuses ambiguous or missing role confirmation", () => {
+    expect(() => ConvexInternalHttpTransport.create({
+      ...stagingOptions,
+      isolatedSyntheticConfirmed: true,
+    })).toThrow(/isolated target/);
+    expect(() => ConvexInternalHttpTransport.create({
+      ...stagingOptions,
+      isolatedStagingConfirmed: false,
+      isolatedSyntheticConfirmed: false,
+    })).toThrow(/isolated target/);
+  });
+
   it("refuses a deployment-name and host mismatch", () => {
     expect(() => ConvexInternalHttpTransport.create({
       ...stagingOptions,

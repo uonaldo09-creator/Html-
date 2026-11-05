@@ -16,6 +16,7 @@ import {
   ConvexMigrationDestination,
 } from "../src/server/convexMigrationDestination";
 import { transformPostgresMigrationRecord } from "../src/server/convexMigrationTransform";
+import { resolveConvexDeploymentTarget } from "../src/server/convexDeploymentTarget";
 
 const TARGET_NAME = "groovy-zebra-380";
 const TARGET_URL = "https://groovy-zebra-380.ap-southeast-2.convex.cloud";
@@ -78,11 +79,13 @@ async function main(): Promise<void> {
     throw new Error("Refusing connection: source is not the approved local V5 database.");
   }
 
-  const target = new URL(TARGET_URL);
-  if (
-    target.hostname !== "groovy-zebra-380.ap-southeast-2.convex.cloud" ||
-    ["prod", "graceful-kangaroo-272"].includes(TARGET_NAME)
-  ) {
+  try {
+    resolveConvexDeploymentTarget({
+      deploymentName: TARGET_NAME,
+      url: TARGET_URL,
+      role: "synthetic-migration",
+    });
+  } catch {
     throw new Error("Refusing target: deployment identity is not the approved isolated target.");
   }
 

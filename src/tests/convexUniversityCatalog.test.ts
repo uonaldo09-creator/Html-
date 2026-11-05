@@ -2,10 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FunctionReturnType } from "convex/server";
 import { api } from "../../convex/_generated/api";
 
-const { query } = vi.hoisted(() => ({ query: vi.fn() }));
+const { query, clientConstructors } = vi.hoisted(() => ({
+  query: vi.fn(),
+  clientConstructors: [] as { url: string; options: unknown }[],
+}));
 
 vi.mock("convex/browser", () => ({
   ConvexHttpClient: class {
+    constructor(url: string, options: unknown) {
+      clientConstructors.push({ url, options });
+    }
     query = query;
   },
 }));
@@ -13,6 +19,7 @@ vi.mock("convex/browser", () => ({
 import {
   getConvexUniversities,
   getConvexUniversityById,
+  resetConvexUniversityCatalogClientCache,
   useConvexUniversityCatalog,
 } from "../server/convexUniversityCatalog";
 
@@ -52,15 +59,15 @@ const university: ConvexUniversity = {
   alumniStories: [],
   campusMap: null,
   directoryProfile: {
-  sourceName: "Fixture",
-  established: "2020",
-  accreditation: "Test accreditation",
-  rankings: "Test ranking",
-  courses: "Testing",
-  feeRange: "Not reported",
-  scholarships: "Not reported",
-  sourceNote: "Synthetic test fixture",
-},
+    sourceName: "Fixture",
+    established: "2020",
+    accreditation: "Test accreditation",
+    rankings: "Test ranking",
+    courses: "Testing",
+    feeRange: "Not reported",
+    scholarships: "Not reported",
+    sourceNote: "Synthetic test fixture",
+  },
   createdAt: 1791936000000,
   reviews: [],
   reviewCount: 0,
@@ -70,6 +77,8 @@ const university: ConvexUniversity = {
 describe("Convex university catalog adapter", () => {
   beforeEach(() => {
     query.mockReset();
+    clientConstructors.length = 0;
+    resetConvexUniversityCatalogClientCache();
     process.env.UNIINFO_CONVEX_DEPLOYMENT = "dev:clear-gopher-925";
     process.env.UNIINFO_CONVEX_URL = "https://clear-gopher-925.ap-southeast-2.convex.cloud";
     delete process.env.UNIINFO_CATALOG_BACKEND;
@@ -116,12 +125,39 @@ describe("Convex university catalog adapter", () => {
     });
   });
 
-  it("rejects any deployment other than the dedicated UniInfo development deployment", async () => {
-    process.env.UNIINFO_CONVEX_DEPLOYMENT = "dev:original-jay-387";
-    await expect(getConvexUniversities()).rejects.toThrow(
-      "UniInfo Convex catalog requires its dedicated development deployment.",
-    );
+  it("caches clients by the normalized deployment origin", async () => {
+    query.mockResolvedValue({ page: [], continueCursor: null, isDone: true });
+
+    await getConvexUniversities();
+    await getConvexUniversities();
+
+    process.env.UNIINFO_CONVEX_DEPLOYMENT = "dev:isolated-staging-123";
+    process.env.UNIINFO_CONVEX_URL = "https://isolated-staging-123.us-east-1.convex.cloud/";
+    await getConvexUniversities();
+
+    expect(clientConstructors.map(({ url }) => url)).toEqual([
+      "https://clear-gopher-925.ap-southeast-2.convex.cloud",
+      "https://isolated-staging-123.us-east-1.convex.cloud",
+    ]);
+  });
+
+  it("refuses protected or mismatched catalog deployments", async () => {
+    process.env.UNIINFO_CONVEX_DEPLOYMENT = "dev:prod";
+    process.env.UNIINFO_CONVEX_URL = "https://prod.convex.cloud";
+    await expect(getConvexUniversities()).rejects.toThrow(/protected/);
+
+    process.env.UNIINFO_CONVEX_DEPLOYMENT = "dev:isolated-staging-123";
+    process.env.UNIINFO_CONVEX_URL = "https://other-deployment-999.convex.cloud";
+    await expect(getConvexUniversities()).rejects.toThrow(/does not match/);
+
     expect(query).not.toHaveBeenCalled();
+    expect(clientConstructors).toEqual([]);
+  });
+
+  it("requires an explicit deployment and URL", async () => {
+    delete process.env.UNIINFO_CONVEX_URL;
+    await expect(getConvexUniversities()).rejects.toThrow(/explicitly configured/);
+    expect(clientConstructors).toEqual([]);
   });
 
   it("resolves a university by its preserved legacy ID", async () => {
