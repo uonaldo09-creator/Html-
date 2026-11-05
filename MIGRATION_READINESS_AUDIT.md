@@ -12,13 +12,96 @@ reproduce those commits byte-for-byte.
 ## Evidence labels
 
 | Label | Meaning |
-| --- | --- |
+| --- | --- | 
 | **[VERIFIED]** | Directly observed in the current checkout or by a command run during this reconstruction. |
+| **[LIVE VERIFIED]** | Verified by an explicit read-only live PostgreSQL inspection of Supabase project King (reported to this agent; not re-queried in this session to avoid repeating production queries). |
 | **[DOC CLAIM]** | Stated by repository documentation or prior reports, but not independently re-verified against a live service. |
 | **[ASSUMPTION]** | Working assumption used to frame a gap; must be confirmed before relying on it. |
 | **[PRODUCT SIGN-OFF]** | A product, security, privacy, or data-owner decision that engineering must not make alone. |
 
 ## 1. Environment and baseline facts
+
+### 1.1 Live source findings (Supabase project King, read-only, 2026-11-05)
+
+**[LIVE VERIFIED]** The following findings were obtained via explicit PostgreSQL read-only transactions and are recorded here without re-querying production:
+
+1. Fourteen public tables exist: the 13 mapped application tables plus `account_sync_outbox`.
+2. Total records: 332 across the inspected public tables.
+3. `account_sync_outbox` exists and contains **0 rows**. It is **not mapped** by the Convex migration registry and remains **PostgreSQL-owned pending approval**.
+4. Drizzle migration `0003_identity_subjects` is applied; `0004_review_user_uniqueness` is **not** applied.
+5. All 13 users have unique, nonblank legacy `uniinfo-user:<id>` auth subjects.
+6. No missing or duplicate auth subjects, no disabled accounts, and all token versions are nonnegative.
+7. Eighteen `chat_history` records have unmatched nonblank `user_email` values (guest/unlinked history; preserved by migration design, no invented user IDs).
+8. Four review groups each contain 39 identical records. There are **152 additional duplicate review rows** (157 reviews total across five universities). Source rows must remain intact.
+9. `university_reviews_agg` is empty despite 157 reviews across five universities (aggregate drift; migration/recomputation policy requires product sign-off).
+10. Live `users.firebase_uid` and `users.sync_version` columns exist in PostgreSQL but are **absent from `src/db/schema.ts`**; their current live values are empty/zero. Schema reconciliation is documentation/remediation only — no live schema/data changes.
+11. `analytics_events.id` is **identity-generated** in PostgreSQL but is not modeled as generated in Drizzle. Migration reads/imports legacy IDs read-only; no sequence/identity mutation performed.
+12. `bookmarks` has maximum existing row ID **6** but PostgreSQL sequence high-water **232**. Reserving Convex ID counters from `max(legacyId)+1` alone is **insufficient** and can reuse previously allocated PostgreSQL IDs; code remediation is implemented on `fix/migration-id-counter-sequence-floor` (fail-closed, read-only sequence metadata).
+
+### 1.2 Approved migration-reader permissions (documentation only; do not execute on King)
+
+**[PRODUCT/SECURITY/DATA-OWNER SIGN-OFF REQUIRED]** For a future approved real-data migration reader, grant the minimum read-only access needed to inspect rows and sequence state:
+
+- `SELECT` on the 13 mapped application tables.
+- `USAGE` on the `public` schema.
+- `SELECT` on the associated mapped sequences needed to inspect sequence state (required because PostgreSQL can report `last_value` as `NULL` both for an unused sequence and when the current role lacks `SELECT`/`USAGE` visibility; the reader must distinguish these cases and fail closed).
+- **No** `USAGE` or `UPDATE` on sequences.
+- **No** `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `CREATE`, role-management, or elevated privileges.
+- **No** `BYPASSRLS`.
+- **No** `nextval()`, `currval()`, or `setval()` calls during source inspection.
+
+Reviewed SQL example for the database owner (grant on mapped sequence objects only; **do not execute against King in this task**):
+
+```sql
+-- Example only. Review, adapt role/schema names, and execute only with explicit approval.
+GRANT USAGE ON SCHEMA public TO migration_reader_role;
+GRANT SELECT ON TABLE
+  public.users,
+  public.universities,
+  public.sessions,
+  public.reviews,
+  public.bookmarks,
+  public.chat_history,
+  public.audit_logs,
+  public.analytics_events,
+  public.login_attempts,
+  public.student_profiles,
+  public.parent_profiles,
+  public.notifications,
+  public.university_reviews_agg
+TO migration_reader_role;
+GRANT SELECT ON SEQUENCE
+  public.users_id_seq,
+  public.reviews_id_seq,
+  public.bookmarks_id_seq,
+  public.chat_history_id_seq,
+  public.audit_logs_id_seq,
+  public.login_attempts_id_seq,
+  public.student_profiles_id_seq,
+  public.parent_profiles_id_seq,
+  public.notifications_id_seq,
+  public.analytics_events_id_seq
+TO migration_reader_role;
+-- Do not grant access to unmapped account_sync_outbox or its sequence.
+```
+
+If sequence metadata cannot be read with confirmed `SELECT` privilege, the import must fail closed and never interpret missing permission as an unused sequence.
+
+### 1.3 Production cutover safety for sequence high-water
+
+A sequence high-water read is **not** a permanent reservation against future PostgreSQL writes. A staging rehearsal does **not** approve production cutover.
+
+Before a production domain is switched to Convex:
+1. Quiesce writes for that domain.
+2. Perform the final PostgreSQL snapshot and sequence high-water inspection.
+3. Reserve the Convex counter floor from the final inspected values.
+4. Complete final reconciliation.
+5. Switch writes only after verification.
+
+
+
+**Privacy/safety:** no personal information, credentials, password hashes, session tokens, or private record contents were recorded in this audit update.
+
 
 - **[VERIFIED]** Working directory is `/home/charlie/Documents/uniinfo-html`.
 - **[VERIFIED]** `origin` is `https://github.com/uonaldo09-creator/Html-.git`.
@@ -156,13 +239,7 @@ Convex while new reviews are still written to PostgreSQL.
 `src/db/schema.ts`. Every declared source table has a registry entry, transform,
 Convex destination, and migration mutation.
 
-**[VERIFIED] `account_sync_outbox`:** a repository-wide search found no
-`account_sync_outbox`, `sync_outbox`, or `outbox` declaration or documentation
-in this checkout. It is therefore **not present in the documented source schema
-available here**, and no mapping or relationship was invented for it. If an
-external source-schema document names this queue, it is outside this checkout:
-per the migration constraint, it must remain **PostgreSQL-owned pending product
-sign-off** and must not be silently added to the Convex migration.
+**[LIVE VERIFIED] `account_sync_outbox`:** the live Supabase project King schema contains `account_sync_outbox` with **0 rows**. A repository-wide source search still finds no Convex mapping/registry/transform for it. It is therefore **present in live PostgreSQL, not mapped to Convex, and remains PostgreSQL-owned pending product/data-owner approval**. Do not add it to the Convex migration without explicit sign-off and contract design.
 
 ### 4.3 Mapping caveats
 
@@ -173,9 +250,7 @@ sign-off** and must not be silently added to the Convex migration.
   exist yet to enforce the same invariants at runtime.
 - **[VERIFIED]** PostgreSQL `ON DELETE CASCADE` behavior has no Convex
   equivalent. Delete paths remain PostgreSQL-only today.
-- **[DOC CLAIM]** The checked-in Drizzle snapshot is stale relative to
-  `src/db/schema.ts`; it is not proof of the live database schema. A read-only
-  live-schema fingerprint is still required before real-data cutover.
+- **[LIVE VERIFIED]** Live schema inspection (King, read-only) confirms 14 public tables including `account_sync_outbox` and the 13 mapped app tables, with 332 total records. Live-vs-Drizzle drift remains: `users.firebase_uid`/`users.sync_version` exist live but are absent from `src/db/schema.ts` (current values empty/zero); `analytics_events.id` is identity-generated live but not modeled as generated in Drizzle. No live schema/data changes were made.
 - **[PRODUCT SIGN-OFF]** Confirm the authoritative source schema, timezone
   convention for `TIMESTAMP WITHOUT TIME ZONE`, retention rules for
   `analytics_events`, and the privacy treatment of historical emails/IPs before

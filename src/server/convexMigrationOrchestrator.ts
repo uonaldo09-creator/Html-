@@ -24,6 +24,17 @@ export type MigrationMode =
   | "postgres-import"
   | "verify";
 
+export interface MigrationIdCounterFloor {
+  /** Maximum existing legacy numeric row ID in the source table, or 0 if none. */
+  maxLegacyId: number;
+  /**
+   * Next ID PostgreSQL's sequence/identity would allocate, if the source table
+   * has an owned sequence. `null` means no sequence metadata applies. This is
+   * read-only metadata only; migration never calls `nextval()` or `setval()`.
+   */
+  sequenceNextId: number | null;
+}
+
 export interface MigrationSource {
   readonly kind: "postgres" | "synthetic";
   beginReadOnlySnapshot(): Promise<void>;
@@ -31,6 +42,12 @@ export interface MigrationSource {
   sourceFingerprint(): Promise<string>;
   countSource(table: SourceTable): Promise<number>;
   readBatch(table: SourceTable, cursor: string | null, limit: number): Promise<MigrationBatch>;
+  /**
+   * Returns the minimum safe Convex ID-counter floor inputs for a table.
+   * Required for approved real PostgreSQL imports so previously allocated
+   * sequence IDs (not present as rows) are never reused by future Convex IDs.
+   */
+  readIdCounterFloor?(table: SourceTable): Promise<MigrationIdCounterFloor>;
 }
 
 export interface MigrationExecutionOptions {
@@ -265,24 +282,47 @@ export async function runConvexMigration(
 
     // Raise each counter-backed table's floor before any write, so an ID handed
     // out while the import is running can never collide with a legacy ID that is
-    // still being streamed in.
+    // still being streamed in or with a PostgreSQL sequence high-water value that
+    // was previously allocated but is no longer present as a row (e.g. deleted
+    // rows/gaps). Real-data imports fail closed unless sequence metadata can be
+    // read without mutation.
     if (options.mode === "postgres-import") {
       if (!destination.reserveIdCounterFloor) {
         throw new Error("Real-data destination cannot reserve ID counters.");
       }
+      if (typeof source.readIdCounterFloor !== "function") {
+        throw new Error(
+          "Real-data imports require read-only PostgreSQL sequence metadata for ID counters. " +
+            "The migration reader must inspect pg_get_serial_sequence()/pg_sequence metadata (no nextval/setval) " +
+            "and fail closed if access is unavailable.",
+        );
+      }
       for (const { source: table } of migrationTables) {
         if (!counterBackedTables.has(table)) continue;
-        let maxLegacyId = 0;
+        let snapshotMaxLegacyId = 0;
         for (const value of snapshot[table]) {
           const transformed = transformPostgresMigrationRecord(table, value).value as
             | Record<string, unknown>
             | undefined;
           const id = transformed?.legacyId;
-          if (typeof id === "number" && Number.isSafeInteger(id) && id > maxLegacyId) {
-            maxLegacyId = id;
+          if (typeof id === "number" && Number.isSafeInteger(id) && id > snapshotMaxLegacyId) {
+            snapshotMaxLegacyId = id;
           }
         }
-        await destination.reserveIdCounterFloor(table, maxLegacyId + 1);
+        const floor = await source.readIdCounterFloor(table);
+        if (!Number.isSafeInteger(floor.maxLegacyId) || floor.maxLegacyId < 0) {
+          throw new Error(`Migration source returned an invalid max legacy ID for ${table}.`);
+        }
+        if (floor.sequenceNextId !== null && (!Number.isSafeInteger(floor.sequenceNextId) || floor.sequenceNextId < 1)) {
+          throw new Error(`Migration source returned an invalid sequence floor for ${table}.`);
+        }
+        const nextId = Math.max(
+          snapshotMaxLegacyId + 1,
+          floor.maxLegacyId + 1,
+          floor.sequenceNextId ?? 1,
+          1,
+        );
+        await destination.reserveIdCounterFloor(table, nextId);
       }
     }
 

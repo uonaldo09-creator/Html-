@@ -162,7 +162,10 @@ class KingSource implements MigrationSource {
   private active = false;
   private reads = 0;
 
-  constructor(private snapshot: KingSnapshot) {}
+  constructor(
+    private snapshot: KingSnapshot,
+    private sequenceNextIds: Partial<Record<SourceTable, number | null>> = {},
+  ) {}
 
   async beginReadOnlySnapshot() {
     if (this.active) throw new Error("KingSource snapshot already active.");
@@ -196,6 +199,23 @@ class KingSource implements MigrationSource {
       })),
       nextCursor: next < rows.length ? String(next) : null,
       done: next >= rows.length,
+    };
+  }
+
+  async readIdCounterFloor(table: SourceTable) {
+    this.assertActive();
+    if (table === "sessions" || table === "universityReviewsAgg") {
+      return { maxLegacyId: 0, sequenceNextId: null };
+    }
+    const maxLegacyId = this.snapshot[table].reduce((max, value) => {
+      const raw = (value as Record<string, unknown>).id;
+      return typeof raw === "number" && Number.isSafeInteger(raw) && raw > max ? raw : max;
+    }, 0);
+    return {
+      maxLegacyId,
+      sequenceNextId: Object.prototype.hasOwnProperty.call(this.sequenceNextIds, table)
+        ? (this.sequenceNextIds[table] ?? null)
+        : maxLegacyId + 1,
     };
   }
 
@@ -618,3 +638,45 @@ describe("migration functions stay internal-only", () => {
     expect(migration.tableNames).toHaveLength(13);
   });
 });
+
+
+  it("reserves ID counters from sequence high-water when rows are missing (bookmarks 6/232)", async () => {
+    const snapshot = kingSnapshot();
+    snapshot.bookmarks = [{
+      id: 6,
+      userEmail: "student@king.test",
+      universityId: 1,
+      createdAt,
+    }];
+    const source = new KingSource(snapshot, { bookmarks: 233 });
+    const destination = new StagingDestination();
+
+    await runConvexMigration(source, destination, IMPORT_OPTIONS);
+    expect(destination.counters.get("bookmarks")).toBe(233);
+  });
+
+  it("fails closed when real-data source cannot provide ID-counter floor metadata", async () => {
+    class NoFloorSource extends KingSource {
+      override async readIdCounterFloor(
+        _table: SourceTable,
+      ): Promise<{ maxLegacyId: number; sequenceNextId: number | null }> {
+        throw new Error("Cannot read PostgreSQL sequence metadata");
+      }
+    }
+    const destination = new StagingDestination();
+    await expect(
+      runConvexMigration(new NoFloorSource(kingSnapshot()), destination, IMPORT_OPTIONS),
+    ).rejects.toThrow(/sequence metadata|read-only/i);
+    expect(destination.insertCalls).toBe(0);
+  });
+
+
+  it("reserves a conservative cached-sequence floor during orchestration", async () => {
+    const snapshot = kingSnapshot();
+    snapshot.bookmarks = [{ id: 6, userEmail: "student@king.test", universityId: 1, createdAt }];
+    // Cached/high-water boundary already reported by PostgreSQL.
+    const source = new KingSource(snapshot, { bookmarks: 233 });
+    const destination = new StagingDestination();
+    await runConvexMigration(source, destination, IMPORT_OPTIONS);
+    expect(destination.counters.get("bookmarks")).toBe(233);
+  });

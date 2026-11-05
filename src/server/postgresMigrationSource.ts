@@ -6,6 +6,7 @@ import {
   type MigrationRecord,
   type SourceTable,
 } from "./convexMigration";
+import type { MigrationIdCounterFloor } from "./convexMigrationOrchestrator";
 
 interface ReadOnlyPgClient {
   query(
@@ -131,6 +132,127 @@ export class PostgresMigrationSource {
       }
     }
     return digest.digest("hex");
+  }
+
+  async readIdCounterFloor(table: SourceTable): Promise<MigrationIdCounterFloor> {
+    this.assertActive();
+    const { sql: sqlTable, keyColumn, keyField } = tableMetadata(table);
+    if (keyField === "token") {
+      return { maxLegacyId: 0, sequenceNextId: null };
+    }
+
+    const maxResult = await this.client.query(
+      `SELECT COALESCE(MAX("${keyColumn}")::bigint, 0::bigint) AS max_id FROM "${sqlTable}"`,
+    );
+    const maxLegacyId = Number(maxResult.rows[0]?.max_id);
+    if (!Number.isSafeInteger(maxLegacyId) || maxLegacyId < 0) {
+      throw new Error(
+        `PostgreSQL migration source returned an unsafe maximum legacy ID for ${table}.`,
+      );
+    }
+
+    let sequenceNextId: number | null = null;
+    try {
+      const sequenceResult = await this.client.query(
+        `SELECT
+           seq_name::text AS seq_name,
+           s.last_value::bigint AS last_value,
+           s.is_called AS is_called,
+           s.seqstart::bigint AS seqstart,
+           s.seqincrement::bigint AS seqincrement,
+           s.seqmin::bigint AS seqmin,
+           s.seqmax::bigint AS seqmax,
+           s.seqcache::bigint AS seqcache,
+           s.seqcycle AS seqcycle,
+           has_sequence_privilege(current_user, s.seqrelid, 'SELECT') AS can_select
+         FROM pg_get_serial_sequence($1::regclass::text, $2) AS seq_name
+         JOIN pg_sequence s ON s.seqrelid = to_regclass(seq_name)
+         WHERE seq_name IS NOT NULL`,
+        [`public.${sqlTable}`, keyColumn],
+      );
+      const sequence = sequenceResult.rows[0];
+      if (sequence) {
+        const canSelect = sequence.can_select === true || sequence.can_select === "t" || sequence.can_select === 1;
+        if (!canSelect) {
+          throw new Error(
+            `Missing SELECT privilege on the sequence associated with ${table}.${keyColumn}. ` +
+              `PostgreSQL can report NULL last_value both for an unused sequence and when the current role lacks SELECT/USAGE visibility; ` +
+              `failing closed. The approved migration reader requires SELECT on this mapped sequence (no USAGE/UPDATE, no nextval/currval/setval).`,
+          );
+        }
+
+        const seqcycle = sequence.seqcycle === true || sequence.seqcycle === "t" || sequence.seqcycle === 1;
+        if (seqcycle) {
+          throw new Error(
+            `Cycling sequence is not supported for ${table}.${keyColumn}; failing closed to prevent ID-counter reuse.`,
+          );
+        }
+
+        const increment = Number(sequence.seqincrement);
+        const startValue = Number(sequence.seqstart);
+        const minValue = Number(sequence.seqmin);
+        const maxValue = Number(sequence.seqmax);
+        const cache = Number(sequence.seqcache);
+        if (
+          !Number.isSafeInteger(increment) || increment <= 0 ||
+          !Number.isSafeInteger(startValue) ||
+          !Number.isSafeInteger(minValue) ||
+          !Number.isSafeInteger(maxValue) ||
+          !Number.isSafeInteger(cache) || cache < 1 ||
+          minValue > maxValue
+        ) {
+          throw new Error(
+            `PostgreSQL sequence metadata is invalid or unsupported for ${table}.${keyColumn} (nonpositive/unsafe increment, invalid bounds, or cache); failing closed.`,
+          );
+        }
+
+        const lastValueRaw = sequence.last_value;
+        const lastValueIsNull = lastValueRaw === null || lastValueRaw === undefined;
+        const isCalled = sequence.is_called === true || sequence.is_called === "t" || sequence.is_called === 1;
+
+        if (lastValueIsNull) {
+          // With confirmed SELECT privilege, a NULL last_value means the sequence
+          // has never been advanced/read by nextval in its current state.
+          sequenceNextId = startValue;
+        } else {
+          const lastValue = Number(lastValueRaw);
+          if (!Number.isSafeInteger(lastValue)) {
+            throw new Error(
+              `PostgreSQL sequence last_value is unsafe for ${table}.${keyColumn}; failing closed.`,
+            );
+          }
+          // last_value may exceed the most recently returned nextval() because of
+          // cached reservations. Reserve a conservative boundary beyond the
+          // reported high-water: last_value itself is the highest reserved value
+          // when is_called is true, so next safe allocation boundary is
+          // last_value + increment.
+          sequenceNextId = isCalled ? lastValue + increment : lastValue;
+        }
+
+        if (
+          !Number.isSafeInteger(sequenceNextId) ||
+          sequenceNextId < 1 ||
+          sequenceNextId > Number.MAX_SAFE_INTEGER ||
+          sequenceNextId < minValue ||
+          sequenceNextId > maxValue + 1
+        ) {
+          throw new Error(
+            `PostgreSQL sequence floor is unsafe or out of bounds for ${table}.${keyColumn}; failing closed.`,
+          );
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Cannot read PostgreSQL sequence metadata for ${table}.${keyColumn} during read-only migration inspection. ` +
+          `The approved migration reader requires SELECT on the mapped source table and SELECT on its associated sequence (if present) to inspect sequence state; ` +
+          `it does not require USAGE/UPDATE and must never call nextval/currval/setval. ` +
+          `Failing closed to prevent Convex ID-counter reuse. ${message}`,
+        { cause: error },
+      );
+    }
+
+    return { maxLegacyId, sequenceNextId };
   }
 
   async countSource(table: SourceTable): Promise<number> {
