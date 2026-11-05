@@ -328,13 +328,13 @@ describe("PostgresMigrationSource", () => {
     await source.close();
   });
 
-  it("treats a genuinely unused sequence as start_value only when SELECT permission is confirmed", async () => {
+  it("uses initial last_value for a genuinely fresh sequence (is_called=false)", async () => {
     const client = new SyntheticReadOnlyPgClient();
     client.rows.reviews = [];
     client.sequenceByTable.reviews = {
-      last_value: null,
+      last_value: 1,
       is_called: false,
-      seqstart: 7,
+      seqstart: 1,
       seqincrement: 1,
       can_select: true,
     };
@@ -343,7 +343,28 @@ describe("PostgresMigrationSource", () => {
 
     await expect(source.readIdCounterFloor("reviews")).resolves.toEqual({
       maxLegacyId: 0,
-      sequenceNextId: 7,
+      sequenceNextId: 1,
+    });
+    await source.close();
+  });
+
+  
+
+  it("returns last_value when is_called=false (SETVAL boundary regression)", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.bookmarks = [];
+    client.sequenceByTable.bookmarks = {
+      last_value: 500,
+      is_called: false,
+      seqstart: 1,
+      seqincrement: 1,
+      can_select: true,
+    };
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+    await expect(source.readIdCounterFloor("bookmarks")).resolves.toEqual({
+      maxLegacyId: 0,
+      sequenceNextId: 500,
     });
     await source.close();
   });
@@ -452,13 +473,13 @@ describe("PostgresMigrationSource", () => {
     await source.close();
   });
 
-  it("uses start_value when sequence state is not called (is_called=false, non-NULL state)", async () => {
+  it("uses last_value when is_called=false even if start_value differs (non-NULL state)", async () => {
     const client = new SyntheticReadOnlyPgClient();
     client.rows.bookmarks = [{ id: 6 }];
     client.sequenceByTable.bookmarks = {
       last_value: 232,
       is_called: false,
-      seqstart: 233,
+      seqstart: 1,
       seqincrement: 1,
       can_select: true,
     };
@@ -466,7 +487,7 @@ describe("PostgresMigrationSource", () => {
     await source.beginReadOnlySnapshot();
     await expect(source.readIdCounterFloor("bookmarks")).resolves.toEqual({
       maxLegacyId: 6,
-      sequenceNextId: 233,
+      sequenceNextId: 232,
     });
     await source.close();
   });

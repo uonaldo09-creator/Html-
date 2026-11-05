@@ -4,7 +4,7 @@ import { PostgresMigrationSource } from "../server/postgresMigrationSource";
 import type { SourceTable } from "../server/convexMigration";
 
 /**
- * Real PostgreSQL 17 integration verification for sequence metadata SQL.
+ * Real PostgreSQL 17+ integration verification for sequence metadata SQL.
  *
  * Runs ONLY when explicitly enabled with a disposable, non-production admin/test
  * connection (never King):
@@ -31,7 +31,7 @@ function makeSource(client: Client): PostgresMigrationSource {
   return new PostgresMigrationSource(client as any);
 }
 
-describe.runIf(shouldRun)("PostgresMigrationSource sequence metadata on real PostgreSQL 17", () => {
+describe.runIf(shouldRun)("PostgresMigrationSource sequence metadata on real PostgreSQL 17+", () => {
   let admin: Client;
   let dbName = "";
   let testUrl = "";
@@ -43,7 +43,7 @@ describe.runIf(shouldRun)("PostgresMigrationSource sequence metadata on real Pos
     const version = await admin.query("SELECT current_setting('server_version_num')::int AS n");
     const major = Math.floor(Number(version.rows[0]?.n ?? 0) / 10000);
     if (major < 17) {
-      throw new Error(`PostgreSQL 17+ required for integration verification; found major ${major}.`);
+      throw new Error(`PostgreSQL 17+ required for integration verification; found server version major ${major}.`);
     }
 
     dbName = `uniinfo_seq_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -93,9 +93,12 @@ describe.runIf(shouldRun)("PostgresMigrationSource sequence metadata on real Pos
         INSERT INTO bookmarks (id, user_email, university_id) VALUES (6, 'x@example.test', 1);
         SELECT setval(pg_get_serial_sequence('bookmarks','id'), 232, true);
 
-        -- genuinely unused serial (never advanced by nextval in this state)
-        -- serial_unused is users: leave empty, reset to start boundary
+        -- genuinely unused/fresh serial: initial last_value with is_called=false
+        -- users left empty, reset to initial boundary
         SELECT setval(pg_get_serial_sequence('users','id'), 1, false);
+
+        -- regression: SETVAL(sequence, 500, false) means next nextval() returns 500
+        SELECT setval(pg_get_serial_sequence('universities','id'), 500, false);
 
         GRANT CONNECT ON DATABASE ${quoteIdent(dbName)} TO uniinfo_seq_reader;
         GRANT USAGE ON SCHEMA public TO uniinfo_seq_reader;
@@ -168,7 +171,7 @@ describe.runIf(shouldRun)("PostgresMigrationSource sequence metadata on real Pos
     }
   });
 
-  it("covers serial populated, identity populated, unused, no-sequence, token-keyed, and agg tables", async () => {
+  it("covers serial/identity populated, fresh/SETVAL(false) regression, missing privilege/no-sequence/token/agg cases", async () => {
     const client = new Client({ connectionString: testUrl });
     await client.connect();
     const source = makeSource(client);
@@ -176,7 +179,10 @@ describe.runIf(shouldRun)("PostgresMigrationSource sequence metadata on real Pos
       await source.beginReadOnlySnapshot();
       await expect(source.readIdCounterFloor("reviews")).resolves.toEqual({ maxLegacyId: 2, sequenceNextId: 4 });
       await expect(source.readIdCounterFloor("analyticsEvents")).resolves.toEqual({ maxLegacyId: 1, sequenceNextId: 233 });
+      // genuinely fresh sequence: initial last_value used (is_called=false)
       await expect(source.readIdCounterFloor("users")).resolves.toEqual({ maxLegacyId: 0, sequenceNextId: 1 });
+      // regression: SETVAL(500,false) => next safe boundary is last_value (500), not seqstart
+      await expect(source.readIdCounterFloor("universities")).resolves.toEqual({ maxLegacyId: 0, sequenceNextId: 500 });
       await expect(source.readIdCounterFloor("auditLogs")).resolves.toEqual({ maxLegacyId: 0, sequenceNextId: null });
       await expect(source.readIdCounterFloor("sessions")).resolves.toEqual({ maxLegacyId: 0, sequenceNextId: null });
       await expect(source.readIdCounterFloor("universityReviewsAgg")).resolves.toEqual({ maxLegacyId: 0, sequenceNextId: null });

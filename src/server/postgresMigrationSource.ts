@@ -135,11 +135,12 @@ export class PostgresMigrationSource {
   }
 
   /**
-   * Read-only PostgreSQL 17 catalog query for sequence configuration and
+   * Read-only PostgreSQL 17+ catalog query for sequence configuration and
    * privilege checks. Runtime state (`last_value`, `is_called`) lives in the
    * sequence relation itself, not in `pg_sequence`; after confirmed SELECT
    * privilege the relation is queried separately with a strictly validated,
    * catalog-derived quoted identifier. No nextval/currval/setval.
+   * Floor semantics: is_called=false => last_value; is_called=true => last_value+increment.
    */
   static readonly SEQUENCE_METADATA_SQL = `
     SELECT
@@ -244,28 +245,23 @@ export class PostgresMigrationSource {
         const isCalled =
           state.is_called === true || state.is_called === "t" || state.is_called === 1;
         const lastValueRaw = state.last_value;
-
-        if (!isCalled) {
-          // Sequence has not been advanced/returned by nextval in its current state.
-          // Use start_value as the next safe allocation boundary (genuinely unused).
-          // Runtime state may still carry last_value; it is not the next allocation.
-          sequenceNextId = startValue;
-        } else {
-          if (lastValueRaw === null || lastValueRaw === undefined) {
-            throw new Error(
-              `PostgreSQL sequence runtime state is incomplete for ${table}.${keyColumn}; failing closed.`,
-            );
-          }
-          const lastValue = Number(lastValueRaw);
-          if (!Number.isSafeInteger(lastValue)) {
-            throw new Error(
-              `PostgreSQL sequence last_value is unsafe for ${table}.${keyColumn}; failing closed.`,
-            );
-          }
-          // last_value is the highest reserved value (can exceed the most recently
-          // returned nextval() because of cache). Reserve conservatively beyond it.
-          sequenceNextId = lastValue + increment;
+        if (lastValueRaw === null || lastValueRaw === undefined) {
+          throw new Error(
+            `PostgreSQL sequence runtime state is incomplete for ${table}.${keyColumn}; failing closed.`,
+          );
         }
+        const lastValue = Number(lastValueRaw);
+        if (!Number.isSafeInteger(lastValue)) {
+          throw new Error(
+            `PostgreSQL sequence last_value is unsafe for ${table}.${keyColumn}; failing closed.`,
+          );
+        }
+
+        // PostgreSQL semantics (supports SETVAL(sequence, 500, false)):
+        // - is_called=false => next nextval() returns last_value exactly.
+        // - is_called=true  => last_value was returned/reserved; next safe
+        //   boundary is last_value + increment (conservative for cache).
+        sequenceNextId = isCalled ? lastValue + increment : lastValue;
 
         if (
           !Number.isSafeInteger(sequenceNextId) ||
