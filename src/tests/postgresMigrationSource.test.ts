@@ -26,6 +26,8 @@ const sqlTables: Record<string, string> = {
 
 class SyntheticReadOnlyPgClient {
   readonly statements: string[] = [];
+  readonly sequenceByTable: Record<string, { last_value: string | number; is_called: boolean; seqincrement?: number } | null> = {};
+  sequenceQueryError: Error | null = null;
   readonly rows: Record<string, Record<string, unknown>[]> = {
     universities: [],
     users: [],
@@ -55,6 +57,30 @@ class SyntheticReadOnlyPgClient {
   async query(text: string, values: unknown[] = []) {
     this.statements.push(text);
     if (text.startsWith("BEGIN") || text === "COMMIT") return { rows: [] };
+    if (text.includes("pg_get_serial_sequence")) {
+      if (this.sequenceQueryError) throw this.sequenceQueryError;
+      const tableName = String(values[0]).replace(/^public\./, "");
+      const sequence = this.sequenceByTable[tableName];
+      if (!sequence) return { rows: [] };
+      return {
+        rows: [{
+          last_value: sequence.last_value,
+          is_called: sequence.is_called,
+          seqincrement: sequence.seqincrement ?? 1,
+        }],
+      };
+    }
+    if (text.includes("COALESCE(MAX(")) {
+      const sqlTable = text.match(/FROM "([a-z_]+)"/)?.[1];
+      if (!sqlTable) throw new Error("Unexpected synthetic SQL.");
+      const sourceTable = sqlTables[sqlTable];
+      const keyColumn = sqlTable === "university_reviews_agg" ? "university_id" : "id";
+      const max = this.rows[sourceTable].reduce((current, row) => {
+        const value = Number(row[keyColumn]);
+        return Number.isSafeInteger(value) && value > current ? value : current;
+      }, 0);
+      return { rows: [{ max_id: String(max) }] };
+    }
 
     const sqlTable = text.match(/FROM "([a-z_]+)"/)?.[1];
     if (!sqlTable) throw new Error("Unexpected synthetic SQL.");
@@ -245,3 +271,55 @@ describe("PostgresMigrationSource", () => {
     }
   });
 });
+
+
+  it("reads sequence-aware ID counter floors without using nextval/setval (bookmarks 6/232)", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.bookmarks = [{ id: 6, user_email: "a@example.test", university_id: 1 }];
+    client.sequenceByTable.bookmarks = { last_value: 232, is_called: true, seqincrement: 1 };
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+
+    await expect(source.readIdCounterFloor("bookmarks")).resolves.toEqual({
+      maxLegacyId: 6,
+      sequenceNextId: 233,
+    });
+    expect(client.statements.some((s) => /nextval|setval/i.test(s))).toBe(false);
+    await source.close();
+  });
+
+  it("handles unused sequences and tables without sequences", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.reviews = [];
+    client.sequenceByTable.reviews = { last_value: 1, is_called: false, seqincrement: 1 };
+    client.rows.auditLogs = [];
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+
+    await expect(source.readIdCounterFloor("reviews")).resolves.toEqual({
+      maxLegacyId: 0,
+      sequenceNextId: 1,
+    });
+    await expect(source.readIdCounterFloor("auditLogs")).resolves.toEqual({
+      maxLegacyId: 0,
+      sequenceNextId: null,
+    });
+    await expect(source.readIdCounterFloor("sessions")).resolves.toEqual({
+      maxLegacyId: 0,
+      sequenceNextId: null,
+    });
+    await source.close();
+  });
+
+  it("fails closed when sequence metadata cannot be read", async () => {
+    const client = new SyntheticReadOnlyPgClient();
+    client.rows.bookmarks = [{ id: 6 }];
+    client.sequenceQueryError = new Error("permission denied for relation pg_sequence");
+    const source = new PostgresMigrationSource(client);
+    await source.beginReadOnlySnapshot();
+
+    await expect(source.readIdCounterFloor("bookmarks")).rejects.toThrow(
+      /sequence metadata|Failing closed|pg_get_serial_sequence|no nextval\/setval/i,
+    );
+    await source.close();
+  });

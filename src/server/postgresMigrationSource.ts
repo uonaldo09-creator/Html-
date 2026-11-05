@@ -6,6 +6,7 @@ import {
   type MigrationRecord,
   type SourceTable,
 } from "./convexMigration";
+import type { MigrationIdCounterFloor } from "./convexMigrationOrchestrator";
 
 interface ReadOnlyPgClient {
   query(
@@ -131,6 +132,68 @@ export class PostgresMigrationSource {
       }
     }
     return digest.digest("hex");
+  }
+
+  async readIdCounterFloor(table: SourceTable): Promise<MigrationIdCounterFloor> {
+    this.assertActive();
+    const { sql: sqlTable, keyColumn, keyField } = tableMetadata(table);
+    if (keyField === "token") {
+      return { maxLegacyId: 0, sequenceNextId: null };
+    }
+
+    const maxResult = await this.client.query(
+      `SELECT COALESCE(MAX("${keyColumn}")::bigint, 0::bigint) AS max_id FROM "${sqlTable}"`,
+    );
+    const maxLegacyId = Number(maxResult.rows[0]?.max_id);
+    if (!Number.isSafeInteger(maxLegacyId) || maxLegacyId < 0) {
+      throw new Error(
+        `PostgreSQL migration source returned an unsafe maximum legacy ID for ${table}.`,
+      );
+    }
+
+    let sequenceNextId: number | null = null;
+    try {
+      const sequenceResult = await this.client.query(
+        `SELECT
+           s.last_value::bigint AS last_value,
+           s.is_called AS is_called,
+           s.seqincrement::bigint AS seqincrement
+         FROM pg_get_serial_sequence($1::regclass::text, $2) AS seq_name
+         JOIN pg_sequence s ON s.seqrelid = to_regclass(seq_name)
+         WHERE seq_name IS NOT NULL`,
+        [`public.${sqlTable}`, keyColumn],
+      );
+      const sequence = sequenceResult.rows[0];
+      if (sequence) {
+        const lastValue = Number(sequence.last_value);
+        const increment = Number(sequence.seqincrement);
+        if (
+          !Number.isSafeInteger(lastValue) ||
+          !Number.isSafeInteger(increment) ||
+          increment < 1
+        ) {
+          throw new Error(
+            `PostgreSQL migration source returned invalid sequence metadata for ${table}.`,
+          );
+        }
+        sequenceNextId = sequence.is_called ? lastValue + increment : lastValue;
+        if (!Number.isSafeInteger(sequenceNextId) || sequenceNextId < 1) {
+          throw new Error(
+            `PostgreSQL migration source returned an unsafe sequence floor for ${table}.`,
+          );
+        }
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Cannot read PostgreSQL sequence metadata for ${table}.${keyColumn} during read-only migration inspection. ` +
+          `Future approved real-data imports require read-only access to pg_get_serial_sequence()/pg_sequence metadata (for example SELECT on the source table and catalog visibility; no nextval/setval). ` +
+          `Failing closed to prevent Convex ID-counter reuse. ${message}`,
+        { cause: error },
+      );
+    }
+
+    return { maxLegacyId, sequenceNextId };
   }
 
   async countSource(table: SourceTable): Promise<number> {

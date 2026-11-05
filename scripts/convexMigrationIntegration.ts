@@ -224,6 +224,21 @@ class SyntheticSource implements MigrationSource {
     return this.snapshot[table].length + (table === this.countOffsetTable ? 1 : 0);
   }
 
+  async readIdCounterFloor(table: SourceTable): Promise<{
+    maxLegacyId: number;
+    sequenceNextId: number | null;
+  }> {
+    this.assertActive();
+    if (table === "sessions" || table === "universityReviewsAgg") {
+      return { maxLegacyId: 0, sequenceNextId: null };
+    }
+    const maxLegacyId = this.snapshot[table].reduce<number>((max, value) => {
+      const raw = (value as Record<string, unknown>).id;
+      return typeof raw === "number" && Number.isSafeInteger(raw) && raw > max ? raw : max;
+    }, 0);
+    return { maxLegacyId, sequenceNextId: maxLegacyId + 1 };
+  }
+
   async readBatch(
     table: SourceTable,
     cursor: string | null,
