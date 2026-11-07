@@ -93,9 +93,7 @@ describe.runIf(shouldRun)("PostgresMigrationSource sequence metadata on real Pos
         INSERT INTO bookmarks (id, user_email, university_id) VALUES (6, 'x@example.test', 1);
         SELECT setval(pg_get_serial_sequence('bookmarks','id'), 232, true);
 
-        -- genuinely unused/fresh serial: initial last_value with is_called=false
-        -- users left empty, reset to initial boundary
-        SELECT setval(pg_get_serial_sequence('users','id'), 1, false);
+        -- genuinely unused/fresh serial: users left empty and users_id_seq untouched after CREATE TABLE
 
         -- regression: SETVAL(sequence, 500, false) means next nextval() returns 500
         SELECT setval(pg_get_serial_sequence('universities','id'), 500, false);
