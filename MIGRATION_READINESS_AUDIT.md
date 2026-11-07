@@ -38,6 +38,20 @@ reproduce those commits byte-for-byte.
 11. `analytics_events.id` is **identity-generated** in PostgreSQL but is not modeled as generated in Drizzle. Migration reads/imports legacy IDs read-only; no sequence/identity mutation performed.
 12. `bookmarks` has maximum existing row ID **6** but PostgreSQL sequence high-water **232**. Reserving Convex ID counters from `max(legacyId)+1` alone is **insufficient** and can reuse previously allocated PostgreSQL IDs; code remediation is implemented on `fix/migration-id-counter-sequence-floor` (fail-closed, read-only sequence metadata).
 
+
+### 1.4 Sequence-floor semantics (implemented, regression-fixed)
+
+- `MigrationIdCounterFloor.sequenceNextId` means the **next safe allocation boundary** for future Convex legacy-style ID allocation for a counter-backed table (the value at/above which Convex may allocate without colliding with PostgreSQL source history). It is computed from read-only catalog/runtime state, never from `nextval/currval/setval`.
+- Catalog config is read via `PostgresMigrationSource.SEQUENCE_METADATA_SQL` (`pg_get_serial_sequence` + `pg_class`/`pg_namespace`/`pg_sequence`, including `has_sequence_privilege(current_user, sequence_oid, 'SELECT')`). Runtime state (`last_value`, `is_called`) is read from the catalog-derived sequence relation **only after confirmed SELECT privilege**.
+- `last_value` must be present and a safe integer in both runtime states.
+- **`is_called=false`** (e.g. `SETVAL(sequence, 500, false)`): `sequenceNextId = last_value` — next `nextval()` returns `last_value` exactly.
+- **`is_called=true`**: `sequenceNextId = last_value + increment` — `last_value` was returned/reserved; boundary is conservative for cache reservations.
+- Result is validated against sequence bounds and JavaScript safe-integer limits. Missing SELECT privilege, invalid metadata, cycling sequences, unsafe/nonpositive increments, unreadable/incomplete state, or unsafe overflow **fail closed**.
+- Tables without an associated sequence/identity generator (and token-keyed/aggregate special cases) preserve `sequenceNextId = null`; orchestrator still applies `max(existing legacy row IDs)+1` lower bounds.
+- Bookmarks expected floor remains **233** for max row 6 / high-water 232.
+
+**PostgreSQL 17+ integration verification status:** `src/tests/postgresSequenceMetadata.pg17.integration.test.ts` executes `PostgresMigrationSource`’s actual SQL/read path against disposable non-production databases only (never King/Supabase). It covers: populated ordinary serial and identity sequences, a genuinely fresh sequence (initial `last_value`, `is_called=false`), the **`SETVAL(...,500,false)` regression => floor 500**, missing SELECT privilege, SELECT without USAGE/UPDATE, no-sequence/token-keyed/aggregate tables, bookmarks row max 6/high-water 232 => 233, repeatable-read/read-only enforcement, and no `nextval/currval/setval` calls. **The six real integration cases passed on PostgreSQL 18.6 on 5 November 2026 (re-verified 7 November 2026).** The regression case returned `sequenceNextId=500`, and the separate genuinely fresh sequence returned its initial `last_value`. The suite accepts PostgreSQL 17+, but PostgreSQL 17 itself was not separately tested; the actual server used was PostgreSQL 18.6.
+
 ### 1.2 Approved migration-reader permissions (documentation only; do not execute on King)
 
 **[PRODUCT/SECURITY/DATA-OWNER SIGN-OFF REQUIRED]** For a future approved real-data migration reader, grant the minimum read-only access needed to inspect rows and sequence state:

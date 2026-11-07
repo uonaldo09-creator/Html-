@@ -134,6 +134,31 @@ export class PostgresMigrationSource {
     return digest.digest("hex");
   }
 
+  /**
+   * Read-only PostgreSQL 17+ catalog query for sequence configuration and
+   * privilege checks. Runtime state (`last_value`, `is_called`) lives in the
+   * sequence relation itself, not in `pg_sequence`; after confirmed SELECT
+   * privilege the relation is queried separately with a strictly validated,
+   * catalog-derived quoted identifier. No nextval/currval/setval.
+   * Floor semantics: is_called=false => last_value; is_called=true => last_value+increment.
+   */
+  static readonly SEQUENCE_METADATA_SQL = `
+    SELECT
+      n.nspname::text AS sequence_schema,
+      c.relname::text AS sequence_name,
+      s.seqstart::bigint AS seqstart,
+      s.seqincrement::bigint AS seqincrement,
+      s.seqmin::bigint AS seqmin,
+      s.seqmax::bigint AS seqmax,
+      s.seqcache::bigint AS seqcache,
+      s.seqcycle AS seqcycle,
+      has_sequence_privilege(current_user, s.seqrelid, 'SELECT') AS can_select
+    FROM pg_get_serial_sequence($1::regclass::text, $2) AS seq_ref
+    JOIN pg_class c ON c.oid = to_regclass(seq_ref::text)
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_sequence s ON s.seqrelid = c.oid
+    WHERE seq_ref IS NOT NULL`;
+
   async readIdCounterFloor(table: SourceTable): Promise<MigrationIdCounterFloor> {
     this.assertActive();
     const { sql: sqlTable, keyColumn, keyField } = tableMetadata(table);
@@ -154,34 +179,23 @@ export class PostgresMigrationSource {
     let sequenceNextId: number | null = null;
     try {
       const sequenceResult = await this.client.query(
-        `SELECT
-           seq_name::text AS seq_name,
-           s.last_value::bigint AS last_value,
-           s.is_called AS is_called,
-           s.seqstart::bigint AS seqstart,
-           s.seqincrement::bigint AS seqincrement,
-           s.seqmin::bigint AS seqmin,
-           s.seqmax::bigint AS seqmax,
-           s.seqcache::bigint AS seqcache,
-           s.seqcycle AS seqcycle,
-           has_sequence_privilege(current_user, s.seqrelid, 'SELECT') AS can_select
-         FROM pg_get_serial_sequence($1::regclass::text, $2) AS seq_name
-         JOIN pg_sequence s ON s.seqrelid = to_regclass(seq_name)
-         WHERE seq_name IS NOT NULL`,
+        PostgresMigrationSource.SEQUENCE_METADATA_SQL,
         [`public.${sqlTable}`, keyColumn],
       );
       const sequence = sequenceResult.rows[0];
       if (sequence) {
-        const canSelect = sequence.can_select === true || sequence.can_select === "t" || sequence.can_select === 1;
+        const canSelect =
+          sequence.can_select === true || sequence.can_select === "t" || sequence.can_select === 1;
         if (!canSelect) {
           throw new Error(
             `Missing SELECT privilege on the sequence associated with ${table}.${keyColumn}. ` +
-              `PostgreSQL can report NULL last_value both for an unused sequence and when the current role lacks SELECT/USAGE visibility; ` +
+              `PostgreSQL sequence runtime state cannot be read without SELECT; ` +
               `failing closed. The approved migration reader requires SELECT on this mapped sequence (no USAGE/UPDATE, no nextval/currval/setval).`,
           );
         }
 
-        const seqcycle = sequence.seqcycle === true || sequence.seqcycle === "t" || sequence.seqcycle === 1;
+        const seqcycle =
+          sequence.seqcycle === true || sequence.seqcycle === "t" || sequence.seqcycle === 1;
         if (seqcycle) {
           throw new Error(
             `Cycling sequence is not supported for ${table}.${keyColumn}; failing closed to prevent ID-counter reuse.`,
@@ -206,28 +220,48 @@ export class PostgresMigrationSource {
           );
         }
 
-        const lastValueRaw = sequence.last_value;
-        const lastValueIsNull = lastValueRaw === null || lastValueRaw === undefined;
-        const isCalled = sequence.is_called === true || sequence.is_called === "t" || sequence.is_called === 1;
-
-        if (lastValueIsNull) {
-          // With confirmed SELECT privilege, a NULL last_value means the sequence
-          // has never been advanced/read by nextval in its current state.
-          sequenceNextId = startValue;
-        } else {
-          const lastValue = Number(lastValueRaw);
-          if (!Number.isSafeInteger(lastValue)) {
-            throw new Error(
-              `PostgreSQL sequence last_value is unsafe for ${table}.${keyColumn}; failing closed.`,
-            );
-          }
-          // last_value may exceed the most recently returned nextval() because of
-          // cached reservations. Reserve a conservative boundary beyond the
-          // reported high-water: last_value itself is the highest reserved value
-          // when is_called is true, so next safe allocation boundary is
-          // last_value + increment.
-          sequenceNextId = isCalled ? lastValue + increment : lastValue;
+        // Sequence runtime state is stored in the sequence relation, not pg_sequence.
+        // The identifier is catalog-derived (allowlisted table/column -> pg_get_serial_sequence)
+        // and strictly validated before quoting.
+        const schemaName = String(sequence.sequence_schema ?? "");
+        const relationName = String(sequence.sequence_name ?? "");
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schemaName) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(relationName)) {
+          throw new Error(
+            `PostgreSQL returned an unexpected sequence identifier for ${table}.${keyColumn}; failing closed.`,
+          );
         }
+        const stateResult = await this.client.query(
+          `SELECT last_value::bigint AS last_value, is_called AS is_called FROM "${schemaName}"."${relationName}"`,
+        );
+        const state = stateResult.rows[0] as
+          | { last_value: unknown; is_called: unknown }
+          | undefined;
+        if (!state) {
+          throw new Error(
+            `PostgreSQL sequence runtime state could not be read for ${table}.${keyColumn}; failing closed.`,
+          );
+        }
+
+        const isCalled =
+          state.is_called === true || state.is_called === "t" || state.is_called === 1;
+        const lastValueRaw = state.last_value;
+        if (lastValueRaw === null || lastValueRaw === undefined) {
+          throw new Error(
+            `PostgreSQL sequence runtime state is incomplete for ${table}.${keyColumn}; failing closed.`,
+          );
+        }
+        const lastValue = Number(lastValueRaw);
+        if (!Number.isSafeInteger(lastValue)) {
+          throw new Error(
+            `PostgreSQL sequence last_value is unsafe for ${table}.${keyColumn}; failing closed.`,
+          );
+        }
+
+        // PostgreSQL semantics (supports SETVAL(sequence, 500, false)):
+        // - is_called=false => next nextval() returns last_value exactly.
+        // - is_called=true  => last_value was returned/reserved; next safe
+        //   boundary is last_value + increment (conservative for cache).
+        sequenceNextId = isCalled ? lastValue + increment : lastValue;
 
         if (
           !Number.isSafeInteger(sequenceNextId) ||
